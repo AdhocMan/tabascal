@@ -9,121 +9,15 @@
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
+#include "tensor.hpp"
 
 namespace ffi = xla::ffi;
 
-template<typename POINTER_T>
-struct Tensor1D {
-  Tensor1D(POINTER_T p, std::int64_t s0) : ptr(p), shape{s0} {}
-
-  inline auto& operator()(std::int64_t i0) {
-    assert(i0 < shape[0]);
-    return ptr[i0];
-  }
-
-  POINTER_T __restrict__ ptr = nullptr;
-  const std::int64_t shape[1] = {0};
-};
-
-
-template<typename POINTER_T>
-struct Tensor2D {
-  Tensor2D(POINTER_T p, std::int64_t s0, std::int64_t s1)
-      : ptr(p), shape{s0, s1} {}
-
-  inline auto& operator()(std::int64_t i0, std::int64_t i1) {
-    assert(i0 < shape[0]);
-    assert(i1 < shape[1]);
-    assert(i1 + shape[1] * i0 < shape[0] * shape[1]);
-    return ptr[i1 + shape[1] * i0];
-  }
-
-  inline Tensor1D<POINTER_T> slice(std::int64_t i0) {
-    return Tensor1D<POINTER_T>(ptr + i0 * shape[1], shape[0]);
-  }
-
-  POINTER_T __restrict__ ptr = nullptr;
-  const std::int64_t shape[2] = {0};
-};
-
-template<typename POINTER_T>
-struct Tensor3D {
-  Tensor3D(POINTER_T p, std::int64_t s0, std::int64_t s1, std::int64_t s2)
-      : ptr(p), shape{s0, s1, s2} {}
-
-  inline auto& operator()(std::int64_t i0, std::int64_t i1, std::int64_t i2) {
-    assert(i0 < shape[0]);
-    assert(i1 < shape[1]);
-    assert(i2 < shape[2]);
-    assert(i2 + shape[2] * (i1 + i0 * shape[1]) < shape[0] * shape[1] * shape[2]);
-    return ptr[i2 + shape[2] * (i1 + i0 * shape[1])];
-  }
-
-  inline Tensor2D<POINTER_T> slice(std::int64_t i0) {
-    return Tensor2D<POINTER_T>(ptr + i0 * shape[1] * shape[2], shape[0],
-                               shape[1]);
-  }
-
-  POINTER_T __restrict__ ptr = nullptr;
-  const std::int64_t shape[3] = {0};
-};
-
-template<typename POINTER_T>
-struct Tensor4D {
-  Tensor4D(POINTER_T p, std::int64_t s0, std::int64_t s1, std::int64_t s2, std::int64_t s3)
-      : ptr(p), shape{s0, s1, s2, s3} {}
-
-  inline auto& operator()(std::int64_t i0, std::int64_t i1, std::int64_t i2, std::int64_t i3) {
-    assert(i0 < shape[0]);
-    assert(i1 < shape[1]);
-    assert(i2 < shape[2]);
-    assert(i3 < shape[3]);
-    // assert(i2 + shape[2] * (i1 + i0 * shape[1]) < shape[0] * shape[1] * shape[2]);
-    return ptr[i3 + shape[3] * (i2 + shape[2] * (i1 + i0 * shape[1]))];
-  }
-
-  inline Tensor3D<POINTER_T> slice(std::int64_t i0) {
-    return Tensor3D<POINTER_T>(ptr + i0 * shape[1] * shape[2] * shape[3],
-                               shape[0], shape[1], shape[2]);
-  }
-
-  POINTER_T __restrict__ ptr = nullptr;
-  const std::int64_t shape[4] = {0};
-};
-
-template<typename POINTER_T>
-struct Tensor5D {
-  Tensor5D(POINTER_T p, std::int64_t s0, std::int64_t s1, std::int64_t s2, std::int64_t s3, std::int64_t s4)
-      : ptr(p), shape{s0, s1, s2, s3, s4} {}
-
-  inline auto& operator()(std::int64_t i0, std::int64_t i1, std::int64_t i2, std::int64_t i3, std::int64_t i4) {
-    assert(i0 < shape[0]);
-    assert(i1 < shape[1]);
-    assert(i2 < shape[2]);
-    assert(i3 < shape[3]);
-    assert(i4 < shape[4]);
-    // assert(i2 + shape[2] * (i1 + i0 * shape[1]) < shape[0] * shape[1] * shape[2]);
-    return ptr[i4 +
-               shape[4] *
-                   (i3 + shape[3] * (i2 + shape[2] * (i1 + i0 * shape[1])))];
-  }
-
-  inline Tensor4D<POINTER_T> slice(std::int64_t i0) {
-    return Tensor4D<POINTER_T>(ptr + i0 * shape[1] * shape[2] * shape[3] *
-                                         shape[4],
-                               shape[0], shape[1], shape[2], shape[3]);
-  }
-
-  POINTER_T __restrict__ ptr = nullptr;
-  const std::int64_t shape[5] = {0};
-};
-
-
+namespace tabascal {
 void rfi_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
                 Tensor4D<const std::complex<double> *> rfi_amp_fine,
                 Tensor4D<const double *> rfi_phase,
                 Tensor3D<std::complex<double> *> rfi_vis) {
-
 
   const auto n_rfi = rfi_amp_fine.shape[0];
   const auto n_ant = rfi_amp_fine.shape[1];
@@ -132,7 +26,6 @@ void rfi_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
   const auto n_bl = a1.shape[0];
   const auto n_time = rfi_vis.shape[2];
   const auto n_freq = rfi_vis.shape[1];
-
 
   assert(a1.shape[0] == a2.shape[0]);
   assert(a1.shape[0] == rfi_vis.shape[0]);
@@ -174,8 +67,9 @@ void rfi_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
               const auto val_rfi_phase_2 =
                   rfi_phase(i_rfi, i_a2, i_f_fine, i_t_fine);
 
-              // ideal shape for memory access: (n_ant, n_f, n_t, n_f_int, n_t_int, n_rfi)
-              // currently: (n_rfi, n_ant, n_f * n_f_int, n_t * n_t_int)
+              // ideal shape for memory access: (n_ant, n_f, n_t, n_f_int,
+              // n_t_int, n_rfi) currently: (n_rfi, n_ant, n_f * n_f_int, n_t *
+              // n_t_int)
               std::complex<double> e(
                   std::cos(val_rfi_phase_1 - val_rfi_phase_2),
                   std::sin(val_rfi_phase_1 - val_rfi_phase_2));
@@ -209,7 +103,6 @@ void rfi_jvp_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
   const auto n_bl = a1.shape[0];
   const auto n_time = grad.shape[2];
   const auto n_freq = grad.shape[1];
-
 
   assert(a1.shape[0] == a2.shape[0]);
   assert(a1.shape[0] == grad.shape[0]);
@@ -261,10 +154,9 @@ void rfi_jvp_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
               const auto val_rfi_phase_grad_2 =
                   rfi_phase_grad(i_rfi, i_a2, i_f_fine, i_t_fine);
 
-
-
-              // ideal shape for memory access: (n_ant, n_f, n_t, n_f_int, n_t_int, n_rfi)
-              // currently: (n_rfi, n_ant, n_f * n_f_int, n_t * n_t_int)
+              // ideal shape for memory access: (n_ant, n_f, n_t, n_f_int,
+              // n_t_int, n_rfi) currently: (n_rfi, n_ant, n_f * n_f_int, n_t *
+              // n_t_int)
               const std::complex<double> val_e(
                   std::cos(val_rfi_phase_1 - val_rfi_phase_2),
                   std::sin(val_rfi_phase_1 - val_rfi_phase_2));
@@ -301,7 +193,8 @@ void rfi_transpose_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
   const auto out_size = rfi_amp_fine_grad.shape[0] *
                         rfi_amp_fine_grad.shape[1] *
                         rfi_amp_fine_grad.shape[2] * rfi_amp_fine_grad.shape[3];
-  std::memset(rfi_amp_fine_grad.ptr, 0, sizeof(std::complex<double>) * out_size);
+  std::memset(rfi_amp_fine_grad.ptr, 0,
+              sizeof(std::complex<double>) * out_size);
   std::memset(rfi_phase_grad.ptr, 0, sizeof(double) * out_size);
 
   const auto n_rfi = rfi_amp_fine.shape[0];
@@ -311,7 +204,6 @@ void rfi_transpose_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
   const auto n_bl = a1.shape[0];
   const auto n_time = rfi_vis_grad.shape[2];
   const auto n_freq = rfi_vis_grad.shape[1];
-
 
   assert(a1.shape[0] == a2.shape[0]);
   assert(a1.shape[0] == rfi_vis_grad.shape[0]);
@@ -358,9 +250,10 @@ void rfi_transpose_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
                   std::cos(val_rfi_phase_1 - val_rfi_phase_2),
                   std::sin(val_rfi_phase_1 - val_rfi_phase_2));
 
-
-              const auto t1 = val_rfi_vis_grad * std::conj(val_rfi_amp_2) * val_e;
-              const auto t2 = std::conj(val_rfi_vis_grad * val_rfi_amp_1 * val_e);
+              const auto t1 =
+                  val_rfi_vis_grad * std::conj(val_rfi_amp_2) * val_e;
+              const auto t2 =
+                  std::conj(val_rfi_vis_grad * val_rfi_amp_1 * val_e);
 
               rfi_amp_fine_grad(i_rfi, i_a1, i_f_fine, i_t_fine) += t1;
               rfi_amp_fine_grad(i_rfi, i_a2, i_f_fine, i_t_fine) += t2;
@@ -374,7 +267,6 @@ void rfi_transpose_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
             }
           }
         }
-
       }
     }
   }
@@ -398,9 +290,8 @@ ffi::Error calc_rfi_vis_cpu_impl(ffi::BufferR1<ffi::S32> a1,
   //   return ffi::Error::InvalidArgument("Expected 1d a1");
   // }
 
-
-  Tensor1D<const int*> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
-  Tensor1D<const int*> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
+  Tensor1D<const int *> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
+  Tensor1D<const int *> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
   Tensor4D<const std::complex<double> *> rfi_amp_fine_tensor(
       rfi_amp_fine.typed_data(), rfi_amp_fine.dimensions()[0],
       rfi_amp_fine.dimensions()[1],
@@ -416,7 +307,6 @@ ffi::Error calc_rfi_vis_cpu_impl(ffi::BufferR1<ffi::S32> a1,
       rfi_vis->typed_data(), rfi_vis->dimensions()[0], rfi_vis->dimensions()[1],
       rfi_vis->dimensions()[2]);
 
-
   rfi_kernel(a1_tensor, a2_tensor, rfi_amp_fine_tensor, rfi_phase_tensor,
              rfi_vis_tensor);
 
@@ -430,7 +320,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_vis_cpu, calc_rfi_vis_cpu_impl,
                                   .Arg<rfi_amp_fine_t>()
                                   .Arg<rfi_phase_t>()
                                   .Ret<ffi::BufferR3<ffi::C128>>());
-
 
 ffi::Error calc_rfi_jvp_cpu_impl(ffi::BufferR1<ffi::S32> a1,
                                  ffi::BufferR1<ffi::S32> a2,
@@ -446,9 +335,8 @@ ffi::Error calc_rfi_jvp_cpu_impl(ffi::BufferR1<ffi::S32> a1,
   //   return ffi::Error::InvalidArgument("Expected 1d a1");
   // }
 
-
-  Tensor1D<const int*> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
-  Tensor1D<const int*> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
+  Tensor1D<const int *> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
+  Tensor1D<const int *> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
   Tensor4D<const std::complex<double> *> rfi_amp_fine_tensor(
       rfi_amp_fine.typed_data(), rfi_amp_fine.dimensions()[0],
       rfi_amp_fine.dimensions()[1],
@@ -471,8 +359,8 @@ ffi::Error calc_rfi_jvp_cpu_impl(ffi::BufferR1<ffi::S32> a1,
       rfi_phase_grad.dimensions()[4] * rfi_phase_grad.dimensions()[5]);
 
   Tensor3D<std::complex<double> *> rfi_grad_tensor(
-      rfi_grad->typed_data(), rfi_grad->dimensions()[0], rfi_grad->dimensions()[1],
-      rfi_grad->dimensions()[2]);
+      rfi_grad->typed_data(), rfi_grad->dimensions()[0],
+      rfi_grad->dimensions()[1], rfi_grad->dimensions()[2]);
 
   rfi_jvp_kernel(a1_tensor, a2_tensor, rfi_amp_fine_tensor,
                  rfi_amp_fine_grad_tensor, rfi_phase_tensor,
@@ -505,9 +393,8 @@ calc_rfi_transpose_cpu_impl(ffi::BufferR1<ffi::S32> a1,
   //   return ffi::Error::InvalidArgument("Expected 1d a1");
   // }
 
-
-  Tensor1D<const int*> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
-  Tensor1D<const int*> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
+  Tensor1D<const int *> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
+  Tensor1D<const int *> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
   Tensor4D<const std::complex<double> *> rfi_amp_fine_tensor(
       rfi_amp_fine.typed_data(), rfi_amp_fine.dimensions()[0],
       rfi_amp_fine.dimensions()[1],
@@ -550,3 +437,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_transpose_cpu,
                                   .Arg<ffi::BufferR3<ffi::C128>>()
                                   .Ret<rfi_amp_fine_t>()
                                   .Ret<rfi_phase_t>());
+} // namespace tabascal
