@@ -150,8 +150,8 @@ ffi::Error calc_rfi_vis_gpu_impl(cudaStream_t stream,
 
   constexpr int block_size = 256;
   static_assert(block_size % tile_size == 0);
-  auto n_time = rfi_vis->dimensions()[1];
-  auto n_bl = a1.dimensions()[0];
+  const auto n_time = rfi_vis_tensor.shape[2];
+  const auto n_bl = a1.dimensions()[0];
 
   dim3 block(block_size);
   auto n_warps = block.x / 32;

@@ -8,14 +8,17 @@ from jax.core import ShapedArray
 import jax.numpy as jnp
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-ax_lib = ctypes.cdll.LoadLibrary(f"{dir_path}/tab.so")
+tab_lib = ctypes.cdll.LoadLibrary(f"{dir_path}/tab.so")
 jax.ffi.register_ffi_target(
-    "calc_rfi", jax.ffi.pycapsule(ax_lib.calc_rfi_vis_cpu), platform="cpu")
+    "calc_rfi", jax.ffi.pycapsule(tab_lib.calc_rfi_vis_cpu), platform="cpu")
 jax.ffi.register_ffi_target(
-    "calc_rfi_jvp", jax.ffi.pycapsule(ax_lib.calc_rfi_jvp_cpu), platform="cpu")
+    "calc_rfi_jvp", jax.ffi.pycapsule(tab_lib.calc_rfi_jvp_cpu), platform="cpu")
 jax.ffi.register_ffi_target(
-    "calc_rfi_transpose", jax.ffi.pycapsule(ax_lib.calc_rfi_transpose_cpu), platform="cpu")
+    "calc_rfi_transpose", jax.ffi.pycapsule(tab_lib.calc_rfi_transpose_cpu), platform="cpu")
 
+tab_lib_gpu = ctypes.cdll.LoadLibrary(f"{dir_path}/tab_gpu.so")
+jax.ffi.register_ffi_target(
+    "calc_rfi_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_vis_gpu), platform="gpu")
 
 rfi_jvp_op = core.Primitive("rfi_jvp_op")
 rfi_jvp_op.def_impl(partial(xla.apply_primitive, rfi_jvp_op))
@@ -72,6 +75,14 @@ def rfi_vis_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
 
 
 mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_cpu, platform='cpu')
+
+def rfi_vis_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
+    res = jax.ffi.ffi_lowering("calc_rfi_gpu")
+    print("========== call custom GPU kernel= ==========")
+    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
+
+
+mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_gpu, platform='gpu')
 
 def rfi_vis_jvp(args, tangents):
   a1, a2, rfi_amp_fine, rfi_phase = args
