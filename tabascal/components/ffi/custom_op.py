@@ -19,6 +19,8 @@ jax.ffi.register_ffi_target(
 tab_lib_gpu = ctypes.cdll.LoadLibrary(f"{dir_path}/tab_gpu.so")
 jax.ffi.register_ffi_target(
     "calc_rfi_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_vis_gpu), platform="gpu")
+jax.ffi.register_ffi_target(
+    "calc_rfi_jvp_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_jvp_gpu), platform="gpu")
 
 rfi_jvp_op = core.Primitive("rfi_jvp_op")
 rfi_jvp_op.def_impl(partial(xla.apply_primitive, rfi_jvp_op))
@@ -39,6 +41,13 @@ def rfi_jvp_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
 mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_cpu, platform='cpu')
+
+def rfi_jvp_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+    res = jax.ffi.ffi_lowering("calc_rfi_jvp_gpu")
+    print("========== call custom GPU jvp kernel= ==========")
+    return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
+
+mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_gpu, platform='gpu')
 
 
 def rfi_jvp_transpose(g, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
@@ -94,13 +103,8 @@ def rfi_vis_jvp(args, tangents):
       rfi_phase_dot = jnp.zeros(rfi_phase.shape, rfi_phase.dtype)
 
 
-  print(f"a1 = {type(a1)}")
-  print(f"a2 = {type(a2)}")
-  print(f"rfi_amp_fine = {type(rfi_amp_fine)}")
-  print(f"rfi_amp_fine_dot = {type(rfi_amp_fine_dot)}")
-  print(f"rfi_phase = {type(rfi_phase)}")
-  print(f"rfi_phase_dot = {type(rfi_phase_dot)}")
   grad = rfi_jvp_op.bind(a1, a2, rfi_amp_fine, rfi_amp_fine_dot, rfi_phase, rfi_phase_dot)
+  #  grad = rfi_jvp_op.bind(a1, a2, rfi_amp_fine, rfi_phase)
 
   return rfi_vis_op.bind(a1, a2, rfi_amp_fine, rfi_phase), grad
 
