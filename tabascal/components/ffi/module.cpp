@@ -212,9 +212,6 @@ void rfi_transpose_kernel(std::int64_t n_int_f, std::int64_t n_int_t,
 
   const double n_int_inv = 1.f / double(n_int_t * n_int_f);
 
-  printf("%ld, %ld, %ld, %ld\n", n_freq, n_time, n_int_f, n_int_t);
-  fflush(stdout);
-
   for (std::int64_t i_bl = 0; i_bl < n_bl; ++i_bl) {
     std::int64_t i_a1 = a1(i_bl);
     std::int64_t i_a2 = a2(i_bl);

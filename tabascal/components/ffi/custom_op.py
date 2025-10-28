@@ -21,6 +21,8 @@ jax.ffi.register_ffi_target(
     "calc_rfi_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_vis_gpu), platform="gpu")
 jax.ffi.register_ffi_target(
     "calc_rfi_jvp_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_jvp_gpu), platform="gpu")
+jax.ffi.register_ffi_target(
+    "calc_rfi_transpose_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_transpose_gpu), platform="gpu")
 
 rfi_jvp_op = core.Primitive("rfi_jvp_op")
 rfi_jvp_op.def_impl(partial(xla.apply_primitive, rfi_jvp_op))
@@ -52,8 +54,12 @@ mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_gpu, platform='gpu')
 
 def rfi_jvp_transpose(g, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
   print("========== call custom transpose kernel= ==========")
+  if rfi_amp_fine.device.platform == 'cpu':
+    kernel_name = "calc_rfi_transpose"
+  else:
+    kernel_name = "calc_rfi_transpose_gpu"
   call = jax.ffi.ffi_call(
-    "calc_rfi_transpose",
+    kernel_name,
     (rfi_amp_fine, rfi_phase),
     vmap_method="sequential",
   )
