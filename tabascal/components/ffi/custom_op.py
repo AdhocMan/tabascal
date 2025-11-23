@@ -39,21 +39,18 @@ rfi_jvp_op.def_abstract_eval(rfi_jvp_abstract)
 
 def rfi_jvp_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
     res = jax.ffi.ffi_lowering("calc_rfi_jvp")
-    print("========== call custom jvp kernel= ==========")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
 mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_cpu, platform='cpu')
 
 def rfi_jvp_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
     res = jax.ffi.ffi_lowering("calc_rfi_jvp_gpu")
-    print("========== call custom GPU jvp kernel= ==========")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
 mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_gpu, platform='gpu')
 
 
 def rfi_jvp_transpose(g, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
-  print("========== call custom transpose kernel= ==========")
   if rfi_amp_fine.device.platform == 'cpu':
     kernel_name = "calc_rfi_transpose"
   else:
@@ -85,7 +82,6 @@ rfi_vis_op.def_abstract_eval(rfi_vis_abstract)
 
 def rfi_vis_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
     res = jax.ffi.ffi_lowering("calc_rfi")
-    print("========== call custom kernel= ==========")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
 
 
@@ -93,7 +89,6 @@ mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_cpu, platform='cpu')
 
 def rfi_vis_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
     res = jax.ffi.ffi_lowering("calc_rfi_gpu")
-    print("========== call custom GPU kernel= ==========")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
 
 
