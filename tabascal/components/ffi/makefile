@@ -6,15 +6,22 @@ else
 CUDACXX ?= nvcc
 endif
 
-CUDA_ARCH ?= 86
+CUDA_FLAGS ?= -O2 -DNDEBUG \
+			  -gencode arch=compute_70,code=compute_70 \
+			  -gencode arch=compute_80,code=compute_80 \
+			  -gencode arch=compute_90,code=compute_90 \
+			  -gencode arch=compute_90a,code=sm_90a
 
+CXX_FLAGS ?= -O2 -DNDEBUG -march=native
 
-# DEBUG_FLAG = -DNDEBUG
+all: cpu gpu
 
-all: tab.so tab_gpu.so
+cpu: tabascal.so
 
-tab.so: module.cpp
-	c++ -shared module.cpp -o tab.so -I $(JAXLIB_HOME)/include -std=c++17  -march=native  -fPIC -O3
+gpu: tabascal_gpu.so
 
-tab_gpu.so: rfi_kernel.cu rfi_jvp_kernel.cu rfi_transpose_kernel.cu
-	$(CUDACXX) -shared -Xcompiler -fPIC -O2 -o tab_gpu.so $^ -I $(JAXLIB_HOME)/include -std=c++17 -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -Xcompiler -Wno-attritutes -Xcompiler -Wno-return-type -Xcudafe "--diag_suppress=940 --diag_suppress=2473"
+tabascal.so: module.cpp
+	c++ -shared module.cpp -o tabascal.so -I $(JAXLIB_HOME)/include -std=c++17  -fPIC $(CXX_FLAGS)
+
+tabascal_gpu.so: rfi_kernel.cu rfi_jvp_kernel.cu rfi_transpose_kernel.cu
+	$(CUDACXX) -shared -Xcompiler -fPIC -o tabascal_gpu.so $^ -I $(JAXLIB_HOME)/include -std=c++17 $(CUDA_FLAGS) -Xcompiler -Wno-attritutes -Xcompiler -Wno-return-type -Xcudafe "--diag_suppress=940 --diag_suppress=2473"

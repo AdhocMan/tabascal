@@ -8,7 +8,7 @@ from jax.core import ShapedArray
 import jax.numpy as jnp
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-tab_lib = ctypes.cdll.LoadLibrary(f"{dir_path}/tab.so")
+tab_lib = ctypes.cdll.LoadLibrary(f"{dir_path}/tabascal.so")
 jax.ffi.register_ffi_target(
     "calc_rfi", jax.ffi.pycapsule(tab_lib.calc_rfi_vis_cpu), platform="cpu")
 jax.ffi.register_ffi_target(
@@ -16,7 +16,7 @@ jax.ffi.register_ffi_target(
 jax.ffi.register_ffi_target(
     "calc_rfi_transpose", jax.ffi.pycapsule(tab_lib.calc_rfi_transpose_cpu), platform="cpu")
 
-tab_lib_gpu = ctypes.cdll.LoadLibrary(f"{dir_path}/tab_gpu.so")
+tab_lib_gpu = ctypes.cdll.LoadLibrary(f"{dir_path}/tabascal_gpu.so")
 jax.ffi.register_ffi_target(
     "calc_rfi_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_vis_gpu), platform="gpu")
 jax.ffi.register_ffi_target(
