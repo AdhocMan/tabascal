@@ -24,6 +24,35 @@ jax.ffi.register_ffi_target(
 jax.ffi.register_ffi_target(
     "calc_rfi_transpose_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_transpose_gpu), platform="gpu")
 
+
+rfi_transpose_op = core.Primitive("rfi_transpose_op")
+rfi_transpose_op.def_impl(partial(xla.apply_primitive, rfi_transpose_op))
+rfi_transpose_op.multiple_results=True
+
+def rfi_transpose_abstract(a1, a2, rfi_amp_fine, rfi_phase, g):
+    n_time = rfi_amp_fine.shape[4]
+    n_freq = rfi_amp_fine.shape[2]
+    n_bl = a1.shape[0]
+
+    t1 = ShapedArray(rfi_amp_fine.shape, rfi_amp_fine.dtype)
+    t2 = ShapedArray(rfi_phase.shape, rfi_phase.dtype)
+    return (t1, t2)
+
+rfi_transpose_op.def_abstract_eval(rfi_transpose_abstract)
+
+def rfi_transpose_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase, g):
+    res = jax.ffi.ffi_lowering("calc_rfi_transpose")
+    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase, g)]
+
+mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_cpu, platform='cpu')
+
+def rfi_transpose_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase, g):
+    res = jax.ffi.ffi_lowering("calc_rfi_transpose_gpu")
+    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase, g)]
+
+mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_gpu, platform='gpu')
+
+
 rfi_jvp_op = core.Primitive("rfi_jvp_op")
 rfi_jvp_op.def_impl(partial(xla.apply_primitive, rfi_jvp_op))
 
@@ -51,16 +80,7 @@ mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_gpu, platform='gpu')
 
 
 def rfi_jvp_transpose(g, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
-  if rfi_amp_fine.device.platform == 'cpu':
-    kernel_name = "calc_rfi_transpose"
-  else:
-    kernel_name = "calc_rfi_transpose_gpu"
-  call = jax.ffi.ffi_call(
-    kernel_name,
-    (rfi_amp_fine, rfi_phase),
-    vmap_method="sequential",
-  )
-  t1, t2 = call(a1, a2, rfi_amp_fine, rfi_phase, g)
+  t1, t2 = rfi_transpose_op.bind(a1, a2, rfi_amp_fine, rfi_phase, g)
 
   return None, None, t1, t1, t2, t2
 
@@ -105,7 +125,6 @@ def rfi_vis_jvp(args, tangents):
 
 
   grad = rfi_jvp_op.bind(a1, a2, rfi_amp_fine, rfi_amp_fine_dot, rfi_phase, rfi_phase_dot)
-  #  grad = rfi_jvp_op.bind(a1, a2, rfi_amp_fine, rfi_phase)
 
   return rfi_vis_op.bind(a1, a2, rfi_amp_fine, rfi_phase), grad
 
