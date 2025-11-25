@@ -34,21 +34,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
     Tensor3D<cuDoubleComplex *, INT_T> rfi_amp_fine_grad,
     Tensor3D<double *, INT_T> rfi_phase_grad) {
 
-  // set to 0 before accumulation
-  // const auto out_size = rfi_amp_fine_grad.shape[0] *
-  //                       rfi_amp_fine_grad.shape[1] *
-  //                       rfi_amp_fine_grad.shape[2];
-
-  // std::memset(rfi_amp_fine_grad.ptr, 0,
-  //             sizeof(std::complex<double>) * out_size);
-  // std::memset(rfi_phase_grad.ptr, 0, sizeof(double) * out_size);
-
   // Specialize BlockReduce type for our thread block
   using BlockReduce_t =
       cub::BlockReduce<double, BLOCK_SIZE, cub::BLOCK_REDUCE_WARP_REDUCTIONS>;
 
   // Shared memory
-  __shared__ typename BlockReduce_t::TempStorage temp_storage;
+  __shared__ typename BlockReduce_t::TempStorage temp_storage[3];
 
 
   const auto n_rfi = rfi_amp_fine.shape[0];
@@ -132,11 +123,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
           }
         }
 
-        rfi_amp_sum.x = BlockReduce_t(temp_storage).Sum(rfi_amp_sum.x);
-        __syncthreads();
-        rfi_amp_sum.y = BlockReduce_t(temp_storage).Sum(rfi_amp_sum.y);
-        __syncthreads();
-        rfi_phase_sum = BlockReduce_t(temp_storage).Sum(rfi_phase_sum);
+        rfi_amp_sum.x = BlockReduce_t(temp_storage[0]).Sum(rfi_amp_sum.x);
+        rfi_amp_sum.y = BlockReduce_t(temp_storage[1]).Sum(rfi_amp_sum.y);
+        rfi_phase_sum = BlockReduce_t(temp_storage[2]).Sum(rfi_phase_sum);
         __syncthreads();
 
         if (threadIdx.x == 0) {
@@ -207,7 +196,8 @@ ffi::Error calc_rfi_transpose_gpu_dispatch(
   // reduce result. If 32, equal to warp size on Nvidia for fast reduce
   // operation.
 
-  constexpr int block_size = 512;
+  // For 64 antenna, 32 yields best results
+  constexpr int block_size = 32;
 
   dim3 block(block_size);
   dim3 grid(n_tf_fine, n_ant, n_rfi);
