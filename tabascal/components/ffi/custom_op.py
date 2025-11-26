@@ -8,21 +8,44 @@ from jax.core import ShapedArray
 import jax.numpy as jnp
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-tab_lib = ctypes.cdll.LoadLibrary(f"{dir_path}/tabascal.so")
-jax.ffi.register_ffi_target(
-    "calc_rfi", jax.ffi.pycapsule(tab_lib.calc_rfi_vis_cpu), platform="cpu")
-jax.ffi.register_ffi_target(
-    "calc_rfi_jvp", jax.ffi.pycapsule(tab_lib.calc_rfi_jvp_cpu), platform="cpu")
-jax.ffi.register_ffi_target(
-    "calc_rfi_transpose", jax.ffi.pycapsule(tab_lib.calc_rfi_transpose_cpu), platform="cpu")
 
-tab_lib_gpu = ctypes.cdll.LoadLibrary(f"{dir_path}/tabascal_gpu.so")
-jax.ffi.register_ffi_target(
-    "calc_rfi_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_vis_gpu), platform="gpu")
-jax.ffi.register_ffi_target(
-    "calc_rfi_jvp_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_jvp_gpu), platform="gpu")
-jax.ffi.register_ffi_target(
-    "calc_rfi_transpose_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_transpose_gpu), platform="gpu")
+tab_lib_path = f"{dir_path}/tabascal.so"
+tab_lib_gpu_path = f"{dir_path}/tabascal_gpu.so"
+
+if os.path.exists(tab_lib_path):
+  tab_lib = ctypes.cdll.LoadLibrary(tab_lib_path)
+  jax.ffi.register_ffi_target(
+      "calc_rfi", jax.ffi.pycapsule(tab_lib.calc_rfi_vis_cpu), platform="cpu")
+  jax.ffi.register_ffi_target(
+      "calc_rfi_jvp", jax.ffi.pycapsule(tab_lib.calc_rfi_jvp_cpu), platform="cpu")
+  jax.ffi.register_ffi_target(
+      "calc_rfi_transpose", jax.ffi.pycapsule(tab_lib.calc_rfi_transpose_cpu), platform="cpu")
+else:
+  tab_lib = None
+
+if os.path.exists(tab_lib_gpu_path):
+  tab_lib_gpu = ctypes.cdll.LoadLibrary(tab_lib_gpu_path)
+  jax.ffi.register_ffi_target(
+      "calc_rfi_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_vis_gpu), platform="gpu")
+  jax.ffi.register_ffi_target(
+      "calc_rfi_jvp_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_jvp_gpu), platform="gpu")
+  jax.ffi.register_ffi_target(
+      "calc_rfi_transpose_gpu", jax.ffi.pycapsule(tab_lib_gpu.calc_rfi_transpose_gpu), platform="gpu")
+else:
+  tab_lib_gpu = None
+
+
+def check_tab_lib():
+  if tab_lib is None:
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    raise RuntimeError(
+        f"FFI selected, but tabascal.so not found! Compilation required, check included makefile at {dir_path}")
+
+def check_tab_lib_gpu():
+  if tab_lib_gpu is None:
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    raise RuntimeError(
+        f"FFI selected, but tabascal_gpu.so not found! Compilation required, check included makefile at {dir_path}")
 
 
 rfi_transpose_op = core.Primitive("rfi_transpose_op")
@@ -41,12 +64,14 @@ def rfi_transpose_abstract(a1, a2, rfi_amp_fine, rfi_phase, g):
 rfi_transpose_op.def_abstract_eval(rfi_transpose_abstract)
 
 def rfi_transpose_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase, g):
+    check_tab_lib()
     res = jax.ffi.ffi_lowering("calc_rfi_transpose")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase, g)]
 
 mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_cpu, platform='cpu')
 
 def rfi_transpose_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase, g):
+    check_tab_lib_gpu()
     res = jax.ffi.ffi_lowering("calc_rfi_transpose_gpu")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase, g)]
 
@@ -67,12 +92,14 @@ def rfi_jvp_abstract(a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_pha
 rfi_jvp_op.def_abstract_eval(rfi_jvp_abstract)
 
 def rfi_jvp_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+    check_tab_lib()
     res = jax.ffi.ffi_lowering("calc_rfi_jvp")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
 mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_cpu, platform='cpu')
 
 def rfi_jvp_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+    check_tab_lib_gpu()
     res = jax.ffi.ffi_lowering("calc_rfi_jvp_gpu")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
@@ -101,6 +128,7 @@ def rfi_vis_abstract(a1, a2, rfi_amp_fine, rfi_phase):
 rfi_vis_op.def_abstract_eval(rfi_vis_abstract)
 
 def rfi_vis_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
+    check_tab_lib()
     res = jax.ffi.ffi_lowering("calc_rfi")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
 
@@ -108,6 +136,7 @@ def rfi_vis_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
 mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_cpu, platform='cpu')
 
 def rfi_vis_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
+    check_tab_lib_gpu()
     res = jax.ffi.ffi_lowering("calc_rfi_gpu")
     return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
 

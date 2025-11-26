@@ -3,6 +3,7 @@ from jax import vmap
 
 from tabascal.interferometry import calculate_rfi_vis_fine, calculate_rfi_vis_variable
 from tabascal.components import Component
+from tabascal.components.ffi.custom_op import rfi_vis_op
 
 
 class RiemannVisCalculation(Component):
@@ -213,7 +214,6 @@ class RiemannVisTimeFreqCalculationFFI(Component):
         n_rfi = self.n_rfi
         n_ant = self.n_ant
 
-        from tabascal.components.ffi.custom_op import rfi_vis_op
 
         def forward(params, state):
             # Pure JAX operations only
