@@ -14,13 +14,13 @@ CUDAFLAGS ?= -O2 -DNDEBUG  \
 			  -gencode arch=compute_90,code=compute_90 \
 			  -gencode arch=compute_90a,code=sm_90a
 
-CXXFLAGS ?= -O2 -DNDEBUG -march=native
+CXXFLAGS ?= -O2 -DNDEBUG -march=native -Wno-return-type -Wno-attributes
 
 
 CXXFLAGS += -std=c++17 -fPIC -I $(JAXLIB_HOME)/include
 
 CUDAFLAGS += -std=c++17 -Xcompiler -fPIC -I $(JAXLIB_HOME)/include \
-			 -Xcompiler -Wno-attritutes \
+			 -Xcompiler -Wno-attributes \
 			 -Xcompiler -Wno-return-type \
 			 -Xcudafe "--diag_suppress=940 --diag_suppress=2473"
 
