@@ -197,6 +197,8 @@ ffi::Error calc_rfi_transpose_gpu_dispatch(
   // operation.
 
   // For 64 antenna, 32 yields best results
+  // The kernel will read n_bl indices, but only compute for n_ant values
+  // Therefore a possible good choice would be n_ant / 2
   constexpr int block_size = 32;
 
   dim3 block(block_size);
