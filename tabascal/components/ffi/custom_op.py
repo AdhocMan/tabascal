@@ -7,6 +7,26 @@ from jax.interpreters import mlir, ad, xla
 from jax.core import ShapedArray
 import jax.numpy as jnp
 
+
+def prepare_indices(n_ant, a1, a2):
+  a1_sorter = jnp.argsort(a1)
+  a2_sorter = jnp.argsort(a2)
+  a1_sorter = jnp.array(a1_sorter, dtype=a1.dtype)
+  a2_sorter = jnp.array(a2_sorter, dtype=a1.dtype)
+
+
+  v = jnp.arange(0, n_ant, dtype=a1.dtype)
+  a1_start = jnp.searchsorted(a1, v, sorter=a1_sorter)
+  a2_start = jnp.searchsorted(a2, v, sorter=a2_sorter)
+
+  print(v)
+  print(a1)
+  print(a1_sorter)
+  print(a1_start)
+
+  return (a1_sorter, a1_start, a2_sorter, a2_start)
+
+
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
 tab_lib_path = f"{dir_path}/tabascal.so"
@@ -52,7 +72,7 @@ rfi_transpose_op = core.Primitive("rfi_transpose_op")
 rfi_transpose_op.def_impl(partial(xla.apply_primitive, rfi_transpose_op))
 rfi_transpose_op.multiple_results=True
 
-def rfi_transpose_abstract(a1, a2, rfi_amp_fine, rfi_phase, g):
+def rfi_transpose_abstract(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g):
     n_time = rfi_amp_fine.shape[4]
     n_freq = rfi_amp_fine.shape[2]
     n_bl = a1.shape[0]
@@ -63,17 +83,17 @@ def rfi_transpose_abstract(a1, a2, rfi_amp_fine, rfi_phase, g):
 
 rfi_transpose_op.def_abstract_eval(rfi_transpose_abstract)
 
-def rfi_transpose_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase, g):
+def rfi_transpose_lowering_cpu(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g):
     check_tab_lib()
     res = jax.ffi.ffi_lowering("calc_rfi_transpose")
-    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase, g)]
+    return [res(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g)]
 
 mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_cpu, platform='cpu')
 
-def rfi_transpose_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase, g):
+def rfi_transpose_lowering_gpu(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g):
     check_tab_lib_gpu()
     res = jax.ffi.ffi_lowering("calc_rfi_transpose_gpu")
-    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase, g)]
+    return [res(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g)]
 
 mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_gpu, platform='gpu')
 
@@ -81,7 +101,7 @@ mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_gpu, platform='g
 rfi_jvp_op = core.Primitive("rfi_jvp_op")
 rfi_jvp_op.def_impl(partial(xla.apply_primitive, rfi_jvp_op))
 
-def rfi_jvp_abstract(a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+def rfi_jvp_abstract(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
     # rfi_amp_fine and rfi_phase shape is
     # (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
     n_time = rfi_amp_fine.shape[4]
@@ -91,25 +111,25 @@ def rfi_jvp_abstract(a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_pha
 
 rfi_jvp_op.def_abstract_eval(rfi_jvp_abstract)
 
-def rfi_jvp_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+def rfi_jvp_lowering_cpu(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
     check_tab_lib()
     res = jax.ffi.ffi_lowering("calc_rfi_jvp")
-    return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
+    return [res(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
 mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_cpu, platform='cpu')
 
-def rfi_jvp_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+def rfi_jvp_lowering_gpu(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
     check_tab_lib_gpu()
     res = jax.ffi.ffi_lowering("calc_rfi_jvp_gpu")
-    return [res(ctx, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
+    return [res(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad)]
 
 mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_gpu, platform='gpu')
 
 
-def rfi_jvp_transpose(g, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
-  t1, t2 = rfi_transpose_op.bind(a1, a2, rfi_amp_fine, rfi_phase, g)
+def rfi_jvp_transpose(g, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad):
+  t1, t2 = rfi_transpose_op.bind(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g)
 
-  return None, None, t1, t1, t2, t2
+  return None, None, None, None, None, None, t1, t1, t2, t2
 
 ad.primitive_transposes[rfi_jvp_op] = rfi_jvp_transpose
 
@@ -117,7 +137,7 @@ ad.primitive_transposes[rfi_jvp_op] = rfi_jvp_transpose
 rfi_vis_op = core.Primitive("rfi_vis_op")
 rfi_vis_op.def_impl(partial(xla.apply_primitive, rfi_vis_op))
 
-def rfi_vis_abstract(a1, a2, rfi_amp_fine, rfi_phase):
+def rfi_vis_abstract(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase):
     # rfi_amp_fine and rfi_phase shape is
     # (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
     n_time = rfi_amp_fine.shape[4]
@@ -127,25 +147,25 @@ def rfi_vis_abstract(a1, a2, rfi_amp_fine, rfi_phase):
 
 rfi_vis_op.def_abstract_eval(rfi_vis_abstract)
 
-def rfi_vis_lowering_cpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
+def rfi_vis_lowering_cpu(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase):
     check_tab_lib()
     res = jax.ffi.ffi_lowering("calc_rfi")
-    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
+    return [res(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase)]
 
 
 mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_cpu, platform='cpu')
 
-def rfi_vis_lowering_gpu(ctx, a1, a2, rfi_amp_fine, rfi_phase):
+def rfi_vis_lowering_gpu(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase):
     check_tab_lib_gpu()
     res = jax.ffi.ffi_lowering("calc_rfi_gpu")
-    return [res(ctx, a1, a2, rfi_amp_fine, rfi_phase)]
+    return [res(ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase)]
 
 
 mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_gpu, platform='gpu')
 
 def rfi_vis_jvp(args, tangents):
-  a1, a2, rfi_amp_fine, rfi_phase = args
-  a1_dot, a2_dot, rfi_amp_fine_dot, rfi_phase_dot = tangents
+  a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase = args
+  _, _, _, _, _, _, rfi_amp_fine_dot, rfi_phase_dot = tangents
 
   if type(rfi_amp_fine_dot) is ad.Zero:
       rfi_amp_fine_dot = jnp.zeros(rfi_amp_fine.shape, rfi_amp_fine.dtype)
@@ -153,8 +173,8 @@ def rfi_vis_jvp(args, tangents):
       rfi_phase_dot = jnp.zeros(rfi_phase.shape, rfi_phase.dtype)
 
 
-  grad = rfi_jvp_op.bind(a1, a2, rfi_amp_fine, rfi_amp_fine_dot, rfi_phase, rfi_phase_dot)
+  grad = rfi_jvp_op.bind(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_amp_fine_dot, rfi_phase, rfi_phase_dot)
 
-  return rfi_vis_op.bind(a1, a2, rfi_amp_fine, rfi_phase), grad
+  return rfi_vis_op.bind(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase), grad
 
 ad.primitive_jvps[rfi_vis_op] = rfi_vis_jvp

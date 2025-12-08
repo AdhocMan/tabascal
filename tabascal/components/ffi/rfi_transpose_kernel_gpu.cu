@@ -26,8 +26,13 @@ namespace gpu {
 
 template <int BLOCK_SIZE, typename INT_T>
 __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
-    INT_T n_int_f, INT_T n_int_t, Tensor1D<const int *, INT_T> a1,
+    INT_T n_int_f, INT_T n_int_t, 
+    Tensor1D<const int *, INT_T> a1,
+    Tensor1D<const int *, INT_T> a1_sorter,
+    Tensor1D<const int *, INT_T> a1_start,
     Tensor1D<const int *, INT_T> a2,
+    Tensor1D<const int *, INT_T> a2_sorter,
+    Tensor1D<const int *, INT_T> a2_start,
     Tensor3D<const cuDoubleComplex *, INT_T> rfi_amp_fine,
     Tensor3D<const double *, INT_T> rfi_phase,
     Tensor3D<const cuDoubleComplex *, INT_T> rfi_vis_grad,
@@ -71,41 +76,34 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
         cuDoubleComplex rfi_amp_sum{0, 0};
         double rfi_phase_sum = 0;
 
-        for (INT_T i_bl = threadIdx.x; i_bl < n_bl; i_bl += blockDim.x) {
+        const auto my_val_rfi_amp = rfi_amp_fine(i_rfi, i_ant, i_tf_fine);
+        const auto my_val_rfi_phase= rfi_phase(i_rfi, i_ant, i_tf_fine);
 
-          INT_T i_a1 = a1(i_bl);
-          INT_T i_a2 = a2(i_bl);
+        const INT_T a1_begin = a1_start(i_ant);
+        const INT_T a1_end = (i_ant == n_ant - 1) ? n_bl : a1_start(i_ant + 1);
 
-          // only process if current antenna index is matched by a1 or a2
-          if (i_a1 != i_ant && i_a2 != i_ant)
-            continue;
+        for (INT_T i_bl_a1 = a1_begin + threadIdx.x; i_bl_a1 < a1_end;
+             i_bl_a1 += BLOCK_SIZE) {
+          const INT_T i_bl = a1_sorter(i_bl_a1);
+          const INT_T i_a2 = a2(i_bl);
+
+          const auto &val_rfi_amp_1 = my_val_rfi_amp;
+          const auto val_rfi_amp_2 = rfi_amp_fine(i_rfi, i_a2, i_tf_fine);
+
+          const auto &val_rfi_phase_1 = my_val_rfi_phase;
+          const auto val_rfi_phase_2 = rfi_phase(i_rfi, i_a2, i_tf_fine);
 
           auto val_rfi_vis_grad = rfi_vis_grad(i_bl, i_f, i_t);
           val_rfi_vis_grad.x *= n_int_inv;
           val_rfi_vis_grad.y *= n_int_inv;
 
-          const auto val_rfi_amp_1 = rfi_amp_fine(i_rfi, i_a1, i_tf_fine);
-          const auto val_rfi_amp_2 = rfi_amp_fine(i_rfi, i_a2, i_tf_fine);
-
-          const auto val_rfi_phase_1 = rfi_phase(i_rfi, i_a1, i_tf_fine);
-          const auto val_rfi_phase_2 = rfi_phase(i_rfi, i_a2, i_tf_fine);
-
           cuDoubleComplex e_val;
           sincos(val_rfi_phase_1 - val_rfi_phase_2, &e_val.y, &e_val.x);
 
-          if (i_a1 == i_ant) {
-            const auto t1 =
-                cuCmul(cuCmul(val_rfi_vis_grad, cuConj(val_rfi_amp_2)), e_val);
+          const auto t1 =
+              cuCmul(cuCmul(val_rfi_vis_grad, cuConj(val_rfi_amp_2)), e_val);
 
-            rfi_amp_sum = cuCadd(t1, rfi_amp_sum);
-          }
-
-          if (i_a2 == i_ant) {
-            const auto t2 =
-                cuConj(cuCmul(cuCmul(val_rfi_vis_grad, val_rfi_amp_1), e_val));
-
-            rfi_amp_sum = cuCadd(t2, rfi_amp_sum);
-          }
+          rfi_amp_sum = cuCadd(t1, rfi_amp_sum);
 
           const auto f1 =
               (cuCmul(cuCmul(cuCmul(cuDoubleComplex{-e_val.y, e_val.x},
@@ -114,14 +112,98 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
                       cuConj(val_rfi_amp_2)))
                   .x;
 
-          if (i_a1 == i_ant) {
-            rfi_phase_sum += f1;
-          }
-
-          if (i_a2 == i_ant) {
-            rfi_phase_sum -= f1;
-          }
+          rfi_phase_sum += f1;
         }
+
+        const INT_T a2_begin = a2_start(i_ant);
+        const INT_T a2_end = (i_ant == n_ant - 1) ? n_bl : a2_start(i_ant + 1);
+
+        for (INT_T i_bl_a2 = a2_begin + threadIdx.x; i_bl_a2 < a2_end;
+             i_bl_a2 += BLOCK_SIZE) {
+          const INT_T i_bl = a2_sorter(i_bl_a2);
+          const INT_T i_a1 = a1(i_bl);
+
+          const auto val_rfi_amp_1 = rfi_amp_fine(i_rfi, i_a1, i_tf_fine);
+          const auto& val_rfi_amp_2 = my_val_rfi_amp;
+
+          const auto val_rfi_phase_1 = rfi_phase(i_rfi, i_a1, i_tf_fine);
+          const auto& val_rfi_phase_2 = my_val_rfi_phase;
+
+          auto val_rfi_vis_grad = rfi_vis_grad(i_bl, i_f, i_t);
+          val_rfi_vis_grad.x *= n_int_inv;
+          val_rfi_vis_grad.y *= n_int_inv;
+
+          cuDoubleComplex e_val;
+          sincos(val_rfi_phase_1 - val_rfi_phase_2, &e_val.y, &e_val.x);
+
+          const auto t2 =
+              cuConj(cuCmul(cuCmul(val_rfi_vis_grad, val_rfi_amp_1), e_val));
+
+          rfi_amp_sum = cuCadd(t2, rfi_amp_sum);
+
+          const auto f1 =
+              (cuCmul(cuCmul(cuCmul(cuDoubleComplex{-e_val.y, e_val.x},
+                                    val_rfi_vis_grad),
+                             val_rfi_amp_1),
+                      cuConj(val_rfi_amp_2)))
+                  .x;
+
+            rfi_phase_sum -= f1;
+        }
+
+        // for (INT_T i_bl_s = threadIdx.x; i_bl_s < n_bl; i_bl_s += blockDim.x) {
+        //   const auto i_bl = a1_sorter(i_bl_s);
+
+
+        //   INT_T i_a1 = a1(i_bl);
+        //   INT_T i_a2 = a2(i_bl);
+
+        //   // only process if current antenna index is matched by a1 or a2
+        //   if (i_a1 != i_ant && i_a2 != i_ant)
+        //     continue;
+
+        //   auto val_rfi_vis_grad = rfi_vis_grad(i_bl, i_f, i_t);
+        //   val_rfi_vis_grad.x *= n_int_inv;
+        //   val_rfi_vis_grad.y *= n_int_inv;
+
+        //   const auto val_rfi_amp_1 = rfi_amp_fine(i_rfi, i_a1, i_tf_fine);
+        //   const auto val_rfi_amp_2 = rfi_amp_fine(i_rfi, i_a2, i_tf_fine);
+
+        //   const auto val_rfi_phase_1 = rfi_phase(i_rfi, i_a1, i_tf_fine);
+        //   const auto val_rfi_phase_2 = rfi_phase(i_rfi, i_a2, i_tf_fine);
+
+        //   cuDoubleComplex e_val;
+        //   sincos(val_rfi_phase_1 - val_rfi_phase_2, &e_val.y, &e_val.x);
+
+        //   if (i_a1 == i_ant) {
+        //     const auto t1 =
+        //         cuCmul(cuCmul(val_rfi_vis_grad, cuConj(val_rfi_amp_2)), e_val);
+
+        //     rfi_amp_sum = cuCadd(t1, rfi_amp_sum);
+        //   }
+
+        //   if (i_a2 == i_ant) {
+        //     const auto t2 =
+        //         cuConj(cuCmul(cuCmul(val_rfi_vis_grad, val_rfi_amp_1), e_val));
+
+        //     rfi_amp_sum = cuCadd(t2, rfi_amp_sum);
+        //   }
+
+        //   const auto f1 =
+        //       (cuCmul(cuCmul(cuCmul(cuDoubleComplex{-e_val.y, e_val.x},
+        //                             val_rfi_vis_grad),
+        //                      val_rfi_amp_1),
+        //               cuConj(val_rfi_amp_2)))
+        //           .x;
+
+        //   if (i_a1 == i_ant) {
+        //     rfi_phase_sum += f1;
+        //   }
+
+        //   if (i_a2 == i_ant) {
+        //     rfi_phase_sum -= f1;
+        //   }
+        // }
 
         rfi_amp_sum.x = BlockReduce_t(temp_storage[0]).Sum(rfi_amp_sum.x);
         rfi_amp_sum.y = BlockReduce_t(temp_storage[1]).Sum(rfi_amp_sum.y);
@@ -145,9 +227,11 @@ using rfi_phase_t = ffi::Buffer<ffi::F64, 6>;
 // dimensions by calling `ComputeRFI` within a loop.
 template <typename INT_T>
 ffi::Error calc_rfi_transpose_gpu_dispatch(
-    cudaStream_t stream, ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a2,
-    rfi_amp_fine_t rfi_amp_fine, rfi_phase_t rfi_phase,
-    ffi::BufferR3<ffi::C128> rfi_vis_grad,
+    cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
+    ffi::BufferR1<ffi::S32> a1_sorter, ffi::BufferR1<ffi::S32> a1_start,
+    ffi::BufferR1<ffi::S32> a2, ffi::BufferR1<ffi::S32> a2_sorter,
+    ffi::BufferR1<ffi::S32> a2_start, rfi_amp_fine_t rfi_amp_fine,
+    rfi_phase_t rfi_phase, ffi::BufferR3<ffi::C128> rfi_vis_grad,
     ffi::Result<rfi_amp_fine_t> rfi_amp_fine_grad,
     ffi::Result<rfi_phase_t> rfi_phase_grad) {
   // rfi_transpose_amp_fine and rfi_transpose_phase shape is
@@ -158,7 +242,12 @@ ffi::Error calc_rfi_transpose_gpu_dispatch(
   // }
 
   Tensor1D<const int *, INT_T> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a1_sorter_tensor(a1_sorter.typed_data(), a1_sorter.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a1_start_tensor(a1_start.typed_data(), a1_start.dimensions()[0]);
   Tensor1D<const int *, INT_T> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a2_sorter_tensor(a2_sorter.typed_data(), a2_sorter.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a2_start_tensor(a2_start.typed_data(), a2_start.dimensions()[0]);
+
   Tensor3D<const cuDoubleComplex *, INT_T> rfi_amp_fine_tensor(
       (const cuDoubleComplex *)rfi_amp_fine.typed_data(),
       rfi_amp_fine.dimensions()[0], rfi_amp_fine.dimensions()[1],
@@ -205,9 +294,9 @@ ffi::Error calc_rfi_transpose_gpu_dispatch(
   dim3 grid(n_tf_fine, n_ant, n_rfi);
 
   rfi_transpose_kernel<block_size, INT_T><<<grid, block, 0, stream>>>(
-      n_int_f, n_int_t, a1_tensor, a2_tensor, rfi_amp_fine_tensor,
-      rfi_phase_tensor, rfi_grad_tensor, rfi_amp_fine_grad_tensor,
-      rfi_phase_grad_tensor);
+      n_int_f, n_int_t, a1_tensor, a1_sorter_tensor, a1_start_tensor, a2_tensor,
+      a2_sorter_tensor, a2_start_tensor, rfi_amp_fine_tensor, rfi_phase_tensor,
+      rfi_grad_tensor, rfi_amp_fine_grad_tensor, rfi_phase_grad_tensor);
 
   const auto status = cudaGetLastError();
   if (status != cudaSuccess) {
@@ -218,13 +307,14 @@ ffi::Error calc_rfi_transpose_gpu_dispatch(
   return ffi::Error::Success();
 }
 
-ffi::Error
-calc_rfi_transpose_gpu_impl(cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
-                            ffi::BufferR1<ffi::S32> a2,
-                            rfi_amp_fine_t rfi_amp_fine, rfi_phase_t rfi_phase,
-                            ffi::BufferR3<ffi::C128> rfi_vis_grad,
-                            ffi::Result<rfi_amp_fine_t> rfi_amp_fine_grad,
-                            ffi::Result<rfi_phase_t> rfi_phase_grad) {
+ffi::Error calc_rfi_transpose_gpu_impl(
+    cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
+    ffi::BufferR1<ffi::S32> a1_sorter, ffi::BufferR1<ffi::S32> a1_start,
+    ffi::BufferR1<ffi::S32> a2, ffi::BufferR1<ffi::S32> a2_sorter,
+    ffi::BufferR1<ffi::S32> a2_start, rfi_amp_fine_t rfi_amp_fine,
+    rfi_phase_t rfi_phase, ffi::BufferR3<ffi::C128> rfi_vis_grad,
+    ffi::Result<rfi_amp_fine_t> rfi_amp_fine_grad,
+    ffi::Result<rfi_phase_t> rfi_phase_grad) {
   constexpr std::int64_t max32 = std::numeric_limits<std::int32_t>::max();
   // use 32 bit indexing if possible
   if (a1.element_count() < max32 && a2.element_count() < max32 &&
@@ -232,12 +322,12 @@ calc_rfi_transpose_gpu_impl(cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
       rfi_phase.element_count() < max32 &&
       rfi_vis_grad.element_count() < max32) {
     return calc_rfi_transpose_gpu_dispatch<std::int32_t>(
-        stream, a1, a2, rfi_amp_fine, rfi_phase, rfi_vis_grad,
-        rfi_amp_fine_grad, rfi_phase_grad);
+        stream, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine,
+        rfi_phase, rfi_vis_grad, rfi_amp_fine_grad, rfi_phase_grad);
   } else {
     return calc_rfi_transpose_gpu_dispatch<std::int64_t>(
-        stream, a1, a2, rfi_amp_fine, rfi_phase, rfi_vis_grad,
-        rfi_amp_fine_grad, rfi_phase_grad);
+        stream, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine,
+        rfi_phase, rfi_vis_grad, rfi_amp_fine_grad, rfi_phase_grad);
   }
 }
 
@@ -245,6 +335,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_transpose_gpu,
                               calc_rfi_transpose_gpu_impl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<rfi_amp_fine_t>()

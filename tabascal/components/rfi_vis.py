@@ -3,7 +3,7 @@ from jax import vmap
 
 from tabascal.interferometry import calculate_rfi_vis_fine, calculate_rfi_vis_variable
 from tabascal.components import Component
-from tabascal.components.ffi.custom_op import rfi_vis_op
+from tabascal.components.ffi.custom_op import rfi_vis_op, prepare_indices
 
 
 class RiemannVisCalculation(Component):
@@ -180,6 +180,13 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             self.n_ant = config.n_ant
             self.n_rfi = config.n_rfi
 
+            a1_sorter, a1_start, a2_sorter, a2_start = prepare_indices(self.n_ant, self.a1, self.a2)
+
+            self.a1_sorter = a1_sorter
+            self.a2_sorter = a2_sorter
+            self.a1_start = a1_start
+            self.a2_start = a2_start
+
             # Validate dimensions
             self._set_outputs()
             # self._validate_dimensions()
@@ -204,6 +211,10 @@ class RiemannVisTimeFreqCalculationFFI(Component):
         # Pre-compute everything possible
         a1 = self.a1
         a2 = self.a2
+        a1_sorter = self.a1_sorter
+        a2_sorter = self.a2_sorter
+        a1_start = self.a1_start
+        a2_start = self.a2_start
         # a1 = self.a2
         # a2 = self.a1
         n_int_time = self.n_int_time
@@ -228,7 +239,7 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             rfi_amp_fine = state["rfi_A"].reshape(new_shape)
             rfi_phase = state["rfi_phase"].reshape(new_shape)
 
-            vis_rfi = rfi_vis_op.bind(a1, a2, rfi_amp_fine, rfi_phase)
+            vis_rfi = rfi_vis_op.bind(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase)
 
 
             state = {**state, "vis_rfi": state["vis_rfi"] + vis_rfi}

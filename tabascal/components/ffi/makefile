@@ -8,7 +8,7 @@ endif
 
 CXX ?= c++
 
-CUDAFLAGS ?= -O2 -DNDEBUG  \
+CUDAFLAGS ?= -O2 -DNDEBUG \
 			  -gencode arch=compute_70,code=compute_70 \
 			  -gencode arch=compute_80,code=compute_80 \
 			  -gencode arch=compute_90,code=compute_90 \

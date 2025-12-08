@@ -172,12 +172,12 @@ calc_rfi_vis_gpu_dispatch(cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
   return ffi::Error::Success();
 }
 
-ffi::Error calc_rfi_vis_gpu_impl(cudaStream_t stream,
-                                 ffi::BufferR1<ffi::S32> a1,
-                                 ffi::BufferR1<ffi::S32> a2,
-                                 rfi_amp_fine_t rfi_amp_fine,
-                                 rfi_phase_t rfi_phase,
-                                 ffi::ResultBufferR3<ffi::C128> rfi_vis) {
+ffi::Error calc_rfi_vis_gpu_impl(
+    cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
+    ffi::BufferR1<ffi::S32> a1_sorter, ffi::BufferR1<ffi::S32> a1_start,
+    ffi::BufferR1<ffi::S32> a2, ffi::BufferR1<ffi::S32> a2_sorter,
+    ffi::BufferR1<ffi::S32> a2_start, rfi_amp_fine_t rfi_amp_fine,
+    rfi_phase_t rfi_phase, ffi::ResultBufferR3<ffi::C128> rfi_vis) {
   constexpr std::int64_t max32 = std::numeric_limits<std::int32_t>::max();
   // use 32 bit indexing if possible
   if (a1.element_count() < max32 && a2.element_count() < max32 &&
@@ -191,10 +191,13 @@ ffi::Error calc_rfi_vis_gpu_impl(cudaStream_t stream,
   }
 }
 
-
 XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_vis_gpu, calc_rfi_vis_gpu_impl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<rfi_amp_fine_t>()
