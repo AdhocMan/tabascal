@@ -19,11 +19,6 @@ def prepare_indices(n_ant, a1, a2):
   a1_start = jnp.searchsorted(a1, v, sorter=a1_sorter)
   a2_start = jnp.searchsorted(a2, v, sorter=a2_sorter)
 
-  print(v)
-  print(a1)
-  print(a1_sorter)
-  print(a1_start)
-
   return (a1_sorter, a1_start, a2_sorter, a2_start)
 
 
