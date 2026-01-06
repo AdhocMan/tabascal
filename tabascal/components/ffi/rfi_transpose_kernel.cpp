@@ -1,15 +1,15 @@
 #include <algorithm>
+#include <cassert>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
-#include <complex>
-#include <cassert>
-#include <stdexcept>
 #include <cstring>
+#include <stdexcept>
 #include <unistd.h>
 
+#include "tensor.hpp"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
-#include "tensor.hpp"
 
 namespace ffi = xla::ffi;
 
@@ -91,13 +91,14 @@ void rfi_transpose_kernel(std::int64_t n_int_f, std::int64_t n_int_t,
 using rfi_amp_fine_t = ffi::Buffer<ffi::C128, 6>;
 using rfi_phase_t = ffi::Buffer<ffi::F64, 6>;
 
-ffi::Error
-calc_rfi_transpose_cpu_impl(ffi::BufferR1<ffi::S32> a1,
-                            ffi::BufferR1<ffi::S32> a2,
-                            rfi_amp_fine_t rfi_amp_fine, rfi_phase_t rfi_phase,
-                            ffi::BufferR3<ffi::C128> rfi_vis_grad,
-                            ffi::Result<rfi_amp_fine_t> rfi_amp_fine_grad,
-                            ffi::Result<rfi_phase_t> rfi_phase_grad) {
+ffi::Error calc_rfi_transpose_cpu_impl(
+    ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
+    ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
+    ffi::BufferR1<ffi::S32> a2_sorter, ffi::BufferR1<ffi::S32> a2_start,
+    rfi_amp_fine_t rfi_amp_fine, rfi_phase_t rfi_phase,
+    ffi::BufferR3<ffi::C128> rfi_vis_grad,
+    ffi::Result<rfi_amp_fine_t> rfi_amp_fine_grad,
+    ffi::Result<rfi_phase_t> rfi_phase_grad) {
   // rfi_amp_fine and rfi_phase shape is
   // (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
 
@@ -149,6 +150,10 @@ calc_rfi_transpose_cpu_impl(ffi::BufferR1<ffi::S32> a1,
 XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_transpose_cpu,
                               calc_rfi_transpose_cpu_impl,
                               ffi::Ffi::Bind()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<rfi_amp_fine_t>()

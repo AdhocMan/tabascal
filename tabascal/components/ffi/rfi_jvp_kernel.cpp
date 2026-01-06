@@ -107,13 +107,13 @@ void rfi_jvp_kernel(Tensor1D<const int *> a1, Tensor1D<const int *> a2,
 using rfi_amp_fine_t = ffi::Buffer<ffi::C128, 6>;
 using rfi_phase_t = ffi::Buffer<ffi::F64, 6>;
 
-ffi::Error calc_rfi_jvp_cpu_impl(ffi::BufferR1<ffi::S32> a1,
-                                 ffi::BufferR1<ffi::S32> a2,
-                                 rfi_amp_fine_t rfi_amp_fine,
-                                 rfi_amp_fine_t rfi_amp_fine_grad,
-                                 rfi_phase_t rfi_phase,
-                                 rfi_phase_t rfi_phase_grad,
-                                 ffi::ResultBufferR3<ffi::C128> rfi_grad) {
+ffi::Error calc_rfi_jvp_cpu_impl(
+    ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
+    ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
+    ffi::BufferR1<ffi::S32> a2_sorter, ffi::BufferR1<ffi::S32> a2_start,
+    rfi_amp_fine_t rfi_amp_fine, rfi_amp_fine_t rfi_amp_fine_grad,
+    rfi_phase_t rfi_phase, rfi_phase_t rfi_phase_grad,
+    ffi::ResultBufferR3<ffi::C128> rfi_grad) {
   // rfi_amp_fine and rfi_phase shape is
   // (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
 
@@ -157,6 +157,10 @@ ffi::Error calc_rfi_jvp_cpu_impl(ffi::BufferR1<ffi::S32> a1,
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_jvp_cpu, calc_rfi_jvp_cpu_impl,
                               ffi::Ffi::Bind()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
+                                  .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
                                   .Arg<rfi_amp_fine_t>()
