@@ -1,22 +1,22 @@
 #include <algorithm>
-#include <cstdint>
-#include <cstdio>
-#include <complex>
 #include <cassert>
-#include <stdexcept>
-#include <limits>
-#include <cstring>
-#include <unistd.h>
-#include <cuda_runtime_api.h>
-#include <cub/block/block_reduce.cuh>
-#include <cuda_runtime.h>
-#include <cuComplex.h>
+#include <complex>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cuComplex.h>
+#include <cub/block/block_reduce.cuh>
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#include <limits>
+#include <stdexcept>
+#include <unistd.h>
 
+#include "tensor.hpp"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
-#include "tensor.hpp"
 
 namespace ffi = xla::ffi;
 namespace cg = cooperative_groups;
@@ -25,19 +25,19 @@ namespace tabascal {
 namespace gpu {
 
 template <int BLOCK_SIZE, typename INT_T>
-__global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
-    INT_T n_int_f, INT_T n_int_t, 
-    Tensor1D<const int *, INT_T> a1,
-    Tensor1D<const int *, INT_T> a1_sorter,
-    Tensor1D<const int *, INT_T> a1_start,
-    Tensor1D<const int *, INT_T> a2,
-    Tensor1D<const int *, INT_T> a2_sorter,
-    Tensor1D<const int *, INT_T> a2_start,
-    Tensor3D<const cuDoubleComplex *, INT_T> rfi_amp_fine,
-    Tensor3D<const double *, INT_T> rfi_phase,
-    Tensor3D<const cuDoubleComplex *, INT_T> rfi_vis_grad,
-    Tensor3D<cuDoubleComplex *, INT_T> rfi_amp_fine_grad,
-    Tensor3D<double *, INT_T> rfi_phase_grad) {
+__global__ void __launch_bounds__(BLOCK_SIZE)
+    rfi_transpose_kernel(INT_T n_int_f, INT_T n_int_t,
+                         Tensor1D<const int *, INT_T> a1,
+                         Tensor1D<const int *, INT_T> a1_sorter,
+                         Tensor1D<const int *, INT_T> a1_start,
+                         Tensor1D<const int *, INT_T> a2,
+                         Tensor1D<const int *, INT_T> a2_sorter,
+                         Tensor1D<const int *, INT_T> a2_start,
+                         Tensor3D<const cuDoubleComplex *, INT_T> rfi_amp_fine,
+                         Tensor3D<const double *, INT_T> rfi_phase,
+                         Tensor3D<const cuDoubleComplex *, INT_T> rfi_vis_grad,
+                         Tensor3D<cuDoubleComplex *, INT_T> rfi_amp_fine_grad,
+                         Tensor3D<double *, INT_T> rfi_phase_grad) {
 
   // Specialize BlockReduce type for our thread block
   using BlockReduce_t =
@@ -45,7 +45,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
 
   // Shared memory
   __shared__ typename BlockReduce_t::TempStorage temp_storage[3];
-
 
   const auto n_rfi = rfi_amp_fine.shape[0];
   const auto n_ant = rfi_amp_fine.shape[1];
@@ -77,7 +76,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
         double rfi_phase_sum = 0;
 
         const auto my_val_rfi_amp = rfi_amp_fine(i_rfi, i_ant, i_tf_fine);
-        const auto my_val_rfi_phase= rfi_phase(i_rfi, i_ant, i_tf_fine);
+        const auto my_val_rfi_phase = rfi_phase(i_rfi, i_ant, i_tf_fine);
 
         const INT_T a1_begin = a1_start(i_ant);
         const INT_T a1_end = (i_ant == n_ant - 1) ? n_bl : a1_start(i_ant + 1);
@@ -124,10 +123,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
           const INT_T i_a1 = a1(i_bl);
 
           const auto val_rfi_amp_1 = rfi_amp_fine(i_rfi, i_a1, i_tf_fine);
-          const auto& val_rfi_amp_2 = my_val_rfi_amp;
+          const auto &val_rfi_amp_2 = my_val_rfi_amp;
 
           const auto val_rfi_phase_1 = rfi_phase(i_rfi, i_a1, i_tf_fine);
-          const auto& val_rfi_phase_2 = my_val_rfi_phase;
+          const auto &val_rfi_phase_2 = my_val_rfi_phase;
 
           auto val_rfi_vis_grad = rfi_vis_grad(i_bl, i_f, i_t);
           val_rfi_vis_grad.x *= n_int_inv;
@@ -148,12 +147,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
                       cuConj(val_rfi_amp_2)))
                   .x;
 
-            rfi_phase_sum -= f1;
+          rfi_phase_sum -= f1;
         }
 
-        // for (INT_T i_bl_s = threadIdx.x; i_bl_s < n_bl; i_bl_s += blockDim.x) {
+        // for (INT_T i_bl_s = threadIdx.x; i_bl_s < n_bl; i_bl_s += blockDim.x)
+        // {
         //   const auto i_bl = a1_sorter(i_bl_s);
-
 
         //   INT_T i_a1 = a1(i_bl);
         //   INT_T i_a2 = a2(i_bl);
@@ -177,14 +176,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_transpose_kernel(
 
         //   if (i_a1 == i_ant) {
         //     const auto t1 =
-        //         cuCmul(cuCmul(val_rfi_vis_grad, cuConj(val_rfi_amp_2)), e_val);
+        //         cuCmul(cuCmul(val_rfi_vis_grad, cuConj(val_rfi_amp_2)),
+        //         e_val);
 
         //     rfi_amp_sum = cuCadd(t1, rfi_amp_sum);
         //   }
 
         //   if (i_a2 == i_ant) {
         //     const auto t2 =
-        //         cuConj(cuCmul(cuCmul(val_rfi_vis_grad, val_rfi_amp_1), e_val));
+        //         cuConj(cuCmul(cuCmul(val_rfi_vis_grad, val_rfi_amp_1),
+        //         e_val));
 
         //     rfi_amp_sum = cuCadd(t2, rfi_amp_sum);
         //   }
@@ -234,19 +235,56 @@ ffi::Error calc_rfi_transpose_gpu_dispatch(
     rfi_phase_t rfi_phase, ffi::BufferR3<ffi::C128> rfi_vis_grad,
     ffi::Result<rfi_amp_fine_t> rfi_amp_fine_grad,
     ffi::Result<rfi_phase_t> rfi_phase_grad) {
-  // rfi_transpose_amp_fine and rfi_transpose_phase shape is
-  // (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
 
-  // if (a1.dimensions().size() != 1) {
-  //   return ffi::Error::InvalidArgument("Expected 1d a1");
-  // }
+  if (a1.dimensions()[0] != a2.dimensions()[0]) {
+    return ffi::Error::InvalidArgument(
+        "Expected a1 and a2 to have the same size");
+  }
+
+  for (int i = 0; i < 6; ++i) {
+    if (rfi_amp_fine.dimensions()[i] != rfi_phase.dimensions()[i]) {
+      return ffi::Error::InvalidArgument(
+          "Expected rfi_amp_fine and rfi_phase to have the same shape");
+    }
+  }
+
+  if (rfi_vis_grad.dimensions()[0] != a1.dimensions()[0]) {
+    return ffi::Error::InvalidArgument(
+        "Expected rfi_vis_grad and a1 to have the same number of baselines");
+  }
+
+  if (rfi_vis_grad.dimensions()[1] != rfi_amp_fine.dimensions()[2]) {
+    return ffi::Error::InvalidArgument(
+        "Expected rfi_vis_grad and rfi_amp_fine to have the same number of "
+        "frequencies");
+  }
+
+  if (rfi_vis_grad.dimensions()[2] != rfi_amp_fine.dimensions()[4]) {
+    return ffi::Error::InvalidArgument("Expected rfi_vis_grad and rfi_amp_fine "
+                                       "to have the same number of times");
+  }
+
+  for (int i = 0; i < 6; ++i) {
+    if (rfi_amp_fine.dimensions()[i] != rfi_amp_fine_grad->dimensions()[i]) {
+      return ffi::Error::InvalidArgument(
+          "Expected rfi_amp_fine and rfi_amp_fine_grad to have the same shape");
+    }
+    if (rfi_phase.dimensions()[i] != rfi_phase_grad->dimensions()[i]) {
+      return ffi::Error::InvalidArgument(
+          "Expected rfi_phase and rfi_phase_grad to have the same shape");
+    }
+  }
 
   Tensor1D<const int *, INT_T> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
-  Tensor1D<const int *, INT_T> a1_sorter_tensor(a1_sorter.typed_data(), a1_sorter.dimensions()[0]);
-  Tensor1D<const int *, INT_T> a1_start_tensor(a1_start.typed_data(), a1_start.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a1_sorter_tensor(a1_sorter.typed_data(),
+                                                a1_sorter.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a1_start_tensor(a1_start.typed_data(),
+                                               a1_start.dimensions()[0]);
   Tensor1D<const int *, INT_T> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
-  Tensor1D<const int *, INT_T> a2_sorter_tensor(a2_sorter.typed_data(), a2_sorter.dimensions()[0]);
-  Tensor1D<const int *, INT_T> a2_start_tensor(a2_start.typed_data(), a2_start.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a2_sorter_tensor(a2_sorter.typed_data(),
+                                                a2_sorter.dimensions()[0]);
+  Tensor1D<const int *, INT_T> a2_start_tensor(a2_start.typed_data(),
+                                               a2_start.dimensions()[0]);
 
   Tensor3D<const cuDoubleComplex *, INT_T> rfi_amp_fine_tensor(
       (const cuDoubleComplex *)rfi_amp_fine.typed_data(),

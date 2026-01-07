@@ -98,12 +98,33 @@ ffi::Error calc_rfi_vis_cpu_impl(
     ffi::BufferR1<ffi::S32> a2_sorter, ffi::BufferR1<ffi::S32> a2_start,
     rfi_amp_fine_t rfi_amp_fine, rfi_phase_t rfi_phase,
     ffi::ResultBufferR3<ffi::C128> rfi_vis) {
-  // rfi_amp_fine and rfi_phase shape is
-  // (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
+  if (a1.dimensions()[0] != a2.dimensions()[0]) {
+    return ffi::Error::InvalidArgument(
+        "Expected a1 and a2 to have the same size");
+  }
 
-  // if (a1.dimensions().size() != 1) {
-  //   return ffi::Error::InvalidArgument("Expected 1d a1");
-  // }
+  for (int i = 0; i < 6; ++i) {
+    if (rfi_amp_fine.dimensions()[i] != rfi_phase.dimensions()[i]) {
+      return ffi::Error::InvalidArgument(
+          "Expected rfi_amp_fine and rfi_phase to have the same shape");
+    }
+  }
+
+  if (rfi_vis->dimensions()[0] != a1.dimensions()[0]) {
+    return ffi::Error::InvalidArgument(
+        "Expected rfi_vis and a1 to have the same number of baselines");
+  }
+
+  if (rfi_vis->dimensions()[1] != rfi_amp_fine.dimensions()[2]) {
+    return ffi::Error::InvalidArgument(
+        "Expected rfi_vis and rfi_amp_fine to have the same number of "
+        "frequencies");
+  }
+
+  if (rfi_vis->dimensions()[2] != rfi_amp_fine.dimensions()[4]) {
+    return ffi::Error::InvalidArgument(
+        "Expected rfi_vis and rfi_amp_fine to have the same number of times");
+  }
 
   Tensor1D<const int *> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
   Tensor1D<const int *> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
