@@ -154,14 +154,9 @@ class FixedOrbit(Component):
 
     def build_forward(self):
         """Return pure, JIT-compatible function"""
-        # Pre-compute everything possible
-        rfi_xyz = self.rfi_xyz
-        rfi_phase = self.rfi_phase
-
         def forward(params, state):
-
-            state = {**state, "rfi_xyz": rfi_xyz, "rfi_phase": rfi_phase}
-
+            # Values are pre-populated in model state during setup.
+            # Keep this a no-op to avoid capturing large constants in the JIT closure.
             return state
 
         return forward

@@ -718,11 +718,6 @@ class FourierTimeFreqGPAst(Component):
 
     def build_forward(self):
         """Return pure, JIT-compatible function"""
-        # Pre-compute everything possible
-        sigma_ast_k = self.sigma_ast_k
-        mu_ast_k = self.mu_ast_k
-        pads = self.pads
-        ss_idxs = self.ss_idxs
         forward_transform = self.forward_transform
 
         def forward(params, state):
@@ -730,9 +725,17 @@ class FourierTimeFreqGPAst(Component):
 
             ast_k_base = params["ast_k_r_base"] + 1.0j * params["ast_k_i_base"]
 
-            ast_k = forward_transform(ast_k_base, sigma_ast_k, mu_ast_k)
+            ast_k = forward_transform(
+                ast_k_base,
+                state["ast_sigma_k"],
+                state["ast_mu_k"],
+            )
 
-            vis_ast = vmap(latent_to_signal, (0, None, None), 0)(ast_k, pads, ss_idxs)
+            vis_ast = vmap(latent_to_signal, (0, None, None), 0)(
+                ast_k,
+                state["ast_pads"],
+                state["ast_ss_idxs"],
+            )
 
             state = {**state, "vis_ast": state["vis_ast"] + vis_ast}
 
@@ -831,6 +834,10 @@ class FourierTimeFreqGPAst(Component):
 
         self.state_outputs = {
             "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "ast_sigma_k": self.sigma_ast_k,
+            "ast_mu_k": self.mu_ast_k,
+            "ast_pads": self.pads,
+            "ast_ss_idxs": self.ss_idxs,
         }
 
     def forward_transform(self, base_params, sigma, mu):

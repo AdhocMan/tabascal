@@ -77,10 +77,6 @@ class RealRFI(Component):
 
     def build_forward(self):
         """Return pure, JIT-compatible function"""
-        # Pre-compute everything possible
-        L_rfi_A = self.L_rfi_A
-        mu_rfi_A = self.mu_rfi_A
-        resample_rfi = self.resample_rfi
         forward_transform = self.forward_transform
 
         def forward(params: dict, state: dict):
@@ -88,10 +84,14 @@ class RealRFI(Component):
 
             rfi_A_induce_base = params["rfi_r_induce_base"]
 
-            rfi_A_induce = forward_transform(rfi_A_induce_base, L_rfi_A, mu_rfi_A)
+            rfi_A_induce = forward_transform(
+                rfi_A_induce_base,
+                state["rfi_L_A"],
+                state["rfi_mu_A"],
+            )
 
             rfi_A = vmap(vmap(vmap(jnp.dot, (None, 0), 0), (None, 1), 1), (None, 2), 2)(
-                resample_rfi, rfi_A_induce
+                state["rfi_resample"], rfi_A_induce
             )
             state = {**state, "rfi_A": rfi_A}
 
@@ -130,6 +130,9 @@ class RealRFI(Component):
             "rfi_A": jnp.zeros(
                 (self.n_rfi, self.n_ant, self.n_freq, self.n_time_fine), dtype=complex
             ),
+            "rfi_L_A": self.L_rfi_A,
+            "rfi_mu_A": self.mu_rfi_A,
+            "rfi_resample": self.resample_rfi,
         }
 
     def _compute_prior_params(self):
@@ -298,10 +301,6 @@ class ComplexRFI(Component):
 
     def build_forward(self):
         """Return pure, JIT-compatible function"""
-        # Pre-compute everything possible
-        L_rfi_A = self.L_rfi_A
-        mu_rfi_A = self.mu_rfi_A
-        resample_rfi = self.resample_rfi
         forward_transform = self.forward_transform
 
         def forward(params: dict, state: dict):
@@ -311,10 +310,14 @@ class ComplexRFI(Component):
                 params["rfi_r_induce_base"] + 1.0j * params["rfi_i_induce_base"]
             )
 
-            rfi_A_induce = forward_transform(rfi_A_induce_base, L_rfi_A, mu_rfi_A)
+            rfi_A_induce = forward_transform(
+                rfi_A_induce_base,
+                state["rfi_L_A"],
+                state["rfi_mu_A"],
+            )
 
             rfi_A = vmap(vmap(vmap(jnp.dot, (None, 0), 0), (None, 1), 1), (None, 2), 2)(
-                resample_rfi, rfi_A_induce
+                state["rfi_resample"], rfi_A_induce
             )
             state = {**state, "rfi_A": rfi_A}
 
@@ -353,6 +356,9 @@ class ComplexRFI(Component):
             "rfi_A": jnp.zeros(
                 (self.n_rfi, self.n_ant, self.n_freq, self.n_time_fine), dtype=complex
             ),
+            "rfi_L_A": self.L_rfi_A,
+            "rfi_mu_A": self.mu_rfi_A,
+            "rfi_resample": self.resample_rfi,
         }
 
     def _compute_prior_params(self):

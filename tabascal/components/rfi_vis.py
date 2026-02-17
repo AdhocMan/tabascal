@@ -3,7 +3,7 @@ from jax import vmap
 
 from tabascal.interferometry import calculate_rfi_vis_fine, calculate_rfi_vis_variable
 from tabascal.components import Component
-from tabascal.components.ffi.rfi_vis_op import RFIVisOp
+from tabascal.components.ffi.rfi_vis_op import rfi_vis_op, prepare_indices
 
 
 class RiemannVisCalculation(Component):
@@ -179,6 +179,9 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             self.n_freq = config.n_freq
             self.n_ant = config.n_ant
             self.n_rfi = config.n_rfi
+            self.a1_sorter, self.a1_start, self.a2_sorter, self.a2_start = prepare_indices(
+                self.n_ant, self.a1, self.a2
+            )
 
             # Validate dimensions
             self._set_outputs()
@@ -209,14 +212,22 @@ class RiemannVisTimeFreqCalculationFFI(Component):
         n_freq = self.n_freq
         n_rfi = self.n_rfi
         n_ant = self.n_ant
-        op = RFIVisOp(n_ant, self.a1, self.a2)
 
         def forward(params, state):
             new_shape = (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
             rfi_amp_fine = state["rfi_A"].reshape(new_shape)
             rfi_phase = state["rfi_phase"].reshape(new_shape)
 
-            vis_rfi = op.eval(rfi_amp_fine, rfi_phase)
+            vis_rfi = rfi_vis_op.bind(
+                state["rfi_vis_a1"],
+                state["rfi_vis_a1_sorter"],
+                state["rfi_vis_a1_start"],
+                state["rfi_vis_a2"],
+                state["rfi_vis_a2_sorter"],
+                state["rfi_vis_a2_start"],
+                rfi_amp_fine,
+                rfi_phase,
+            )
 
             state = {**state, "vis_rfi": state["vis_rfi"] + vis_rfi}
 
@@ -228,6 +239,12 @@ class RiemannVisTimeFreqCalculationFFI(Component):
 
         self.state_outputs = {
             "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "rfi_vis_a1": self.a1,
+            "rfi_vis_a1_sorter": self.a1_sorter,
+            "rfi_vis_a1_start": self.a1_start,
+            "rfi_vis_a2": self.a2,
+            "rfi_vis_a2_sorter": self.a2_sorter,
+            "rfi_vis_a2_start": self.a2_start,
         }
 
 

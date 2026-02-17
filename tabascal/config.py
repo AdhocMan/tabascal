@@ -213,9 +213,8 @@ class Model:
     ):
 
         self.noise = config.noise
-        self.likelihood = lambda pred, obs_data: likelihood(
-            pred, obs_data, {"noise": config.noise, "flags": config.flags}
-        )
+        self.flags = config.flags
+        self.likelihood_fn = likelihood
 
         components = [C() for C in import_components(component_list)]
         self.components = components
@@ -234,6 +233,8 @@ class Model:
         self.state["rmse_ast"] = jnp.array([jnp.nan])
         self.state["rmse_rfi"] = jnp.array([jnp.nan])
         self.state["rmse_gains"] = jnp.array([jnp.nan])
+        self.state["noise"] = self.noise
+        self.state["flags"] = self.flags
 
         self.forward = self.build_forward()
         self.prob_model = self.build_prob_model()
@@ -268,10 +269,11 @@ class Model:
         set_params = self.build_set_params()
         forward = self.forward
 
-        def prob_model(obs_data=None):
+        def prob_model(obs_data=None, state=None):
 
             params = set_params()
-            state = self.state
+            if state is None:
+                state = self.state
 
             state = forward(params, state)
 
@@ -284,7 +286,11 @@ class Model:
             numpyro.deterministic("vis_obs", state["vis_obs"])
 
             if obs_data is not None:
-                self.likelihood(state["vis_obs"], obs_data)
+                self.likelihood_fn(
+                    state["vis_obs"],
+                    obs_data,
+                    {"noise": state["noise"], "flags": state["flags"]},
+                )
 
             return state
 

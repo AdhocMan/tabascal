@@ -48,13 +48,10 @@ class UnitaryGains(Component):
 
     def build_forward(self):
         """Return pure, JIT-compatible function"""
-        # Pre-compute everything possible
-        gains = self.state_outputs["gains"]
-
         def forward(params, state):
             # Pure JAX operations only
             vis_obs = state["vis_rfi"] + state["vis_ast"]
-            state = {**state, "vis_obs": vis_obs, "gains": gains}
+            state = {**state, "vis_obs": vis_obs}
             return state
 
         return forward
