@@ -15,6 +15,7 @@ from tabascal.components.gains import (
     GPGains,
     gains_config_validation,
 )
+from tabascal.config import Precision
 
 from .conftest import make_constants, assert_transform_roundtrip
 
@@ -59,6 +60,7 @@ def make_gains_config(
         int_time=int_time,
         a1=a1.astype("int32"),
         a2=a2.astype("int32"),
+        dtype=Precision("double"),
         args={
             "gains": {
                 "r_seed": 123,

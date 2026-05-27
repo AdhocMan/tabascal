@@ -152,10 +152,11 @@ def tabascal_subtraction(config, sim_dir, ms_path=None, norad_ids=[], suffix="",
         print(f"log_l : {nlog_l:.3e}")
         print(f"log_p : {nlog_p:.3e}")
 
+        c_dtype = tab_config.dtype.complex
         truth = {
-            "vis_rfi": jnp.nan * jnp.zeros((tab_config.n_bl, tab_config.n_freq, tab_config.n_time), dtype=complex),
-            "vis_ast": jnp.nan * jnp.zeros((tab_config.n_bl, tab_config.n_freq, tab_config.n_time), dtype=complex),
-            "gains": jnp.nan * jnp.ones((tab_config.n_ant, tab_config.n_freq, tab_config.n_time), dtype=complex),
+            "vis_rfi": jnp.nan * jnp.zeros((tab_config.n_bl, tab_config.n_freq, tab_config.n_time), dtype=c_dtype),
+            "vis_ast": jnp.nan * jnp.zeros((tab_config.n_bl, tab_config.n_freq, tab_config.n_time), dtype=c_dtype),
+            "gains": jnp.nan * jnp.ones((tab_config.n_ant, tab_config.n_freq, tab_config.n_time), dtype=c_dtype),
         }
 
         if config["plots"]["init"]:

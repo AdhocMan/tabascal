@@ -60,8 +60,30 @@ def validate_tab_config(config: Dict):
 
     pass
 
-    
-    
+
+class Precision:
+    """Resolve a precision mode string to JAX float/complex dtypes.
+
+    Held on TabConfig so every array allocation in the pipeline can pick the
+    same precision without consulting the global `jax_enable_x64` flag. Future
+    mixed-precision support can grow per-array overrides on this class.
+    """
+
+    def __init__(self, mode: str = "double"):
+        mode = mode.lower()
+        if mode == "double":
+            self.float = jnp.float64
+            self.complex = jnp.complex128
+        elif mode == "single":
+            self.float = jnp.float32
+            self.complex = jnp.complex64
+        else:
+            raise ValueError(
+                f"Unknown precision '{mode}'. Use 'single' or 'double'."
+            )
+        self.mode = mode
+
+
 class TabConfig:
     """Configuration parameters for tabascal method"""
 
@@ -70,6 +92,7 @@ class TabConfig:
         # self.config = config
         self.args = config
         self.ms_path = ms_path
+        self.dtype = Precision(config.get("precision", "double"))
         self.spacetrack_path = config["satellites"].get("spacetrack_path")
         self.extra_tle_dir = config["satellites"].get("extra_tle_dir")
 
@@ -124,7 +147,11 @@ class TabConfig:
 
     def read_ms_params(self, freq: float, corr: str, data_col: str):
 
-        ms_params = read_ms(self.ms_path, freq, None, corr, data_col)
+        ms_params = read_ms(
+            self.ms_path, freq, None, corr, data_col, dtype=self.dtype
+        )
+
+        f_dtype = self.dtype.float
 
         self.phase_centre = {"ra": ms_params["ra"], "dec": ms_params["dec"]}
         self.dish_d = ms_params["dish_d"]
@@ -140,11 +167,11 @@ class TabConfig:
         self.n_corr = ms_params["n_corr"]
 
         self.int_time = ms_params["int_time"]
-        self.times = np.asarray(ms_params["times"])
-        self.times_jd = mjd_to_jd(ms_params["times_mjd"])
+        self.times = np.asarray(ms_params["times"], dtype=f_dtype)
+        self.times_jd = mjd_to_jd(ms_params["times_mjd"]).astype(f_dtype)
 
         self.chan_width = ms_params["chan_width"]
-        self.freqs = np.asarray(ms_params["freqs"])
+        self.freqs = np.asarray(ms_params["freqs"], dtype=f_dtype)
 
         self.noise = ms_params["noise"]
         self.a1 = ms_params["a1"]
@@ -191,7 +218,7 @@ class TabConfig:
         # self.n_int_time = int(jnp.ceil(n_int_factor * self.int_time * sample_freq))
         # self.n_int_time = max(1, self.n_int_time)
 
-        self.max_rfi_vis = jnp.max(jnp.abs(self.vis_obs))
+        self.max_rfi_vis = jnp.max(jnp.abs(self.vis_obs)).astype(self.dtype.float)
         sample_freq_bl = (
             jnp.pi
             * jnp.max(jnp.abs(fringe_freq), axis=(0, 1))
@@ -215,10 +242,15 @@ class TabConfig:
             self.args["rfi"]["freq_pad_factor"],
             self.args["rfi"]["time_pad_factor"],
         ]
-        self.freqs_fine, self.times_fine = domain_ss(ns, dxs, x0s, ss_factors, pad_factors)
+        freqs_fine, times_fine = domain_ss(ns, dxs, x0s, ss_factors, pad_factors)
+        f_dtype = self.dtype.float
+        self.freqs_fine = freqs_fine.astype(f_dtype)
+        self.times_fine = times_fine.astype(f_dtype)
         self.n_freq_fine = len(self.freqs_fine)
         self.n_time_fine = len(self.times_fine)
-        self.times_jd_fine = self.times_jd[0] + secs_to_days(self.times_fine)
+        self.times_jd_fine = (
+            self.times_jd[0] + secs_to_days(self.times_fine)
+        ).astype(f_dtype)
 
     def get_orbital_elements(self, norad_ids: List[int], extra_tle_dir: Optional[str] = None):
 
@@ -260,12 +292,14 @@ class Model:
             for key, value in comp.build_constants().items():
                 self.constants[f"{comp.prefix}/{key}"] = value
 
-        self.state["vis_ast"] = jnp.zeros_like(self.state["vis_obs"])
-        self.state["vis_rfi"] = jnp.zeros_like(self.state["vis_obs"])
+        c_dtype = tab_config.dtype.complex
+        f_dtype = tab_config.dtype.float
+        self.state["vis_ast"] = jnp.zeros_like(self.state["vis_obs"], dtype=c_dtype)
+        self.state["vis_rfi"] = jnp.zeros_like(self.state["vis_obs"], dtype=c_dtype)
 
-        self.state["rmse_ast"] = jnp.array([jnp.nan])
-        self.state["rmse_rfi"] = jnp.array([jnp.nan])
-        self.state["rmse_gains"] = jnp.array([jnp.nan])
+        self.state["rmse_ast"] = jnp.array([jnp.nan], dtype=f_dtype)
+        self.state["rmse_rfi"] = jnp.array([jnp.nan], dtype=f_dtype)
+        self.state["rmse_gains"] = jnp.array([jnp.nan], dtype=f_dtype)
 
         self.forward = self.build_forward()
         self.prob_model = self.build_prob_model()

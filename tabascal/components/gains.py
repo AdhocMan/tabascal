@@ -141,6 +141,7 @@ class BaseGPGains(Component):
         self.n_ant = tab_config.n_ant
         self.n_bl = tab_config.n_bl
         self.n_freq = tab_config.n_freq
+        self.dtype = tab_config.dtype
         self.n_freq_fine = tab_config.n_freq_fine
         self.n_int_freq = tab_config.n_int_freq
         self.n_time = tab_config.n_time
@@ -176,8 +177,8 @@ class BaseGPGains(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "gains": jnp.ones((self.n_ant, self.n_freq, self.n_time), dtype=complex),
-            "vis_obs": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "gains": jnp.ones((self.n_ant, self.n_freq, self.n_time), dtype=self.dtype.complex),
+            "vis_obs": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
     def _compute_gp_params(self):

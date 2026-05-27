@@ -15,23 +15,23 @@ import xarray as xr
 from typing import Tuple, Dict, Callable
 
 
-def read_true_rfi_A(sim_zarr_path: str, data_col: str, times: Array) -> Array:
+def read_true_rfi_A(sim_zarr_path: str, data_col: str, times: Array, dtype=jnp.complex128) -> Array:
 
     xds = xr.open_zarr(sim_zarr_path)
     interp = lambda _rfi_A: jnp.interp(times, xds.time_fine.data, _rfi_A)
 
     data_type = get_observation_data_type(data_col)
 
-    if data_type["rfi"]: 
+    if data_type["rfi"]:
         # xds.rfi_tle_sat_A is shape (n_rfi, n_time_fine, n_ant, n_freq)
         # rfi_A_fine is shape (n_rfi, n_ant, n_freq, n_time_fine)
-        rfi_A_fine = jnp.transpose(jnp.array(xds.rfi_tle_sat_A.data.compute()), (0, 2, 3, 1))
+        rfi_A_fine = jnp.transpose(jnp.array(xds.rfi_tle_sat_A.data.compute(), dtype=dtype), (0, 2, 3, 1))
         # rfi_A is shape (n_rfi, n_ant, n_freq, n_time)
         rfi_A = vmap(vmap(vmap(interp)))(rfi_A_fine)
 
         return rfi_A
     else:
-        return jnp.zeros((xds.tle_sat_src.data[0], xds.n_ant, xds.n_freq, xds.n_time), dtype=complex)
+        return jnp.zeros((xds.tle_sat_src.data[0], xds.n_ant, xds.n_freq, xds.n_time), dtype=dtype)
 
 
 def compute_real_space_gp_params(gp_l: float, gp_var: float, times: Array, times_fine: Array) -> Tuple[int, Array, Array]:
@@ -171,10 +171,11 @@ class BaseGPRFI(Component):
         # Random seed used for random sampling such as initial parameters drawn from the prior
         self.r_seed = rfi_config["r_seed"]
 
-        # Basic shape parameters 
+        # Basic shape parameters
         self.n_rfi = tab_config.n_rfi
         self.n_ant = tab_config.n_ant
         self.n_freq = tab_config.n_freq
+        self.dtype = tab_config.dtype
         self.n_freq_fine = tab_config.n_freq_fine
         self.n_int_freq = tab_config.n_int_freq
         self.n_time = tab_config.n_time
@@ -198,7 +199,7 @@ class BaseGPRFI(Component):
 
         self.state_outputs = {
             "rfi_A": jnp.zeros(
-                (self.n_rfi, self.n_ant, self.n_freq_fine, self.n_time_fine), dtype=complex
+                (self.n_rfi, self.n_ant, self.n_freq_fine, self.n_time_fine), dtype=self.dtype.complex
             ),
         }
 
@@ -311,7 +312,9 @@ class RealRFI(BaseGPRFI):
 
     def _compute_true_params(self, sim_zarr_path: str, data_col: str):
 
-        self.true_rfi_A_induce = read_true_rfi_A(sim_zarr_path, data_col, self.rfi_times).real
+        self.true_rfi_A_induce = read_true_rfi_A(
+            sim_zarr_path, data_col, self.rfi_times, dtype=self.dtype.complex
+        ).real
         self.true_rfi_A_induce_base = self.inv_transform(self.true_rfi_A_induce, self.L_rfi_A, self.mu_rfi_A)
 
     def forward_transform(self, base_params, L, mu):
@@ -478,12 +481,14 @@ class ComplexRFI(BaseGPRFI):
 
         self.L_rfi_A = cholesky(self.rfi_times, self.gp_var, self.corr_time, 1e-8)
         self.mu_rfi_A = jnp.zeros(
-            (self.n_rfi, self.n_ant, self.n_freq, self.n_rfi_times), dtype=complex
+            (self.n_rfi, self.n_ant, self.n_freq, self.n_rfi_times), dtype=self.dtype.complex
         )
 
     def _compute_true_params(self, sim_zarr_path, data_col):
 
-        self.true_rfi_A_induce = read_true_rfi_A(sim_zarr_path, data_col, self.rfi_times)
+        self.true_rfi_A_induce = read_true_rfi_A(
+            sim_zarr_path, data_col, self.rfi_times, dtype=self.dtype.complex
+        )
         self.true_rfi_A_induce_base = self.inv_transform(self.true_rfi_A_induce, self.L_rfi_A, self.mu_rfi_A)
 
     def forward_transform(self, base_params, L, mu):
@@ -726,7 +731,7 @@ class FourierGPRFI(BaseGPRFI):
         elif prior_type in ["zeros", 0]:
             print("Using zeros for RFI prior mean")
             self.mu_rfi_k = jnp.zeros(
-                (self.n_rfi, self.n_ant, self.n_k_freq_rfi, self.n_k_time_rfi), dtype=complex
+                (self.n_rfi, self.n_ant, self.n_k_freq_rfi, self.n_k_time_rfi), dtype=self.dtype.complex
             )
         else:
             raise ValueError(f"Provided prior type: {prior_type} is not valid. Choose from (data, zeros).")
@@ -745,7 +750,7 @@ class FourierGPRFI(BaseGPRFI):
 
     def _compute_true_params(self, sim_zarr_path: str, data_col: str):
 
-        rfi_A = read_true_rfi_A(sim_zarr_path, data_col, self.times)
+        rfi_A = read_true_rfi_A(sim_zarr_path, data_col, self.times, dtype=self.dtype.complex)
         self.true_rfi_k_A = vmap(vmap(self.signal_to_latent))(rfi_A)
         self.true_rfi_k_A_base = self.inv_transform(self.true_rfi_k_A, self.sigma_rfi_k, self.mu_rfi_k)
 
@@ -772,13 +777,13 @@ class FourierGPRFI(BaseGPRFI):
         elif init_type in ["zeros", 0]:
             print("Using zeros for rfi_A init")
             # zeros_k is shape (1, 1, n_k_freq_rfi, n_k_time_rfi)
-            zeros_k = self.signal_to_latent(jnp.zeros((self.n_freq, self.n_time), dtype=complex))[None,None,:,:]
+            zeros_k = self.signal_to_latent(jnp.zeros((self.n_freq, self.n_time), dtype=self.dtype.complex))[None,None,:,:]
             # init_rfi_k is shape (n_rfi, n_ant, n_k_freq_rfi, n_k_time_rfi)
             self.init_rfi_k = zeros_k * jnp.ones((self.n_rfi, self.n_ant, 1, 1))
         elif init_type in ["ones", 1]:
             print("Using ones for rfi_A init")
             # ones_k is shape (1, 1, n_k_freq_rfi, n_k_time_rfi)
-            ones_k = self.signal_to_latent(jnp.ones((self.n_freq, self.n_time), dtype=complex))[None,None,:,:]
+            ones_k = self.signal_to_latent(jnp.ones((self.n_freq, self.n_time), dtype=self.dtype.complex))[None,None,:,:]
             # init_rfi_k is shape (n_rfi, n_ant, n_k_freq_rfi, n_k_time_rfi)
             self.init_rfi_k = ones_k * jnp.ones((self.n_rfi, self.n_ant, 1, 1))
         elif init_type == "sample":
@@ -786,7 +791,7 @@ class FourierGPRFI(BaseGPRFI):
             base_sample = random.normal(
                 random.PRNGKey(self.r_seed),
                 (self.n_rfi, self.n_ant, self.n_k_freq_rfi, self.n_k_time_rfi),
-                dtype=complex,
+                dtype=self.dtype.complex,
             )
             self.init_rfi_k = self.forward_transform(base_sample, self.sigma_rfi_k, self.mu_rfi_k)
         else:
@@ -993,7 +998,7 @@ class FourierGPRFIConstAnt(BaseGPRFI):
         elif prior_type in ["zeros", 0]:
             print("Using zeros for RFI prior mean")
             self.mu_rfi_k = jnp.zeros(
-                (self.n_rfi, 1, self.n_k_freq_rfi, self.n_k_time_rfi), dtype=complex
+                (self.n_rfi, 1, self.n_k_freq_rfi, self.n_k_time_rfi), dtype=self.dtype.complex
             )
         else:
             raise ValueError(f"Provided prior type: {prior_type} is not valid. Choose from (data, zeros).")
@@ -1013,7 +1018,11 @@ class FourierGPRFIConstAnt(BaseGPRFI):
     def _compute_true_params(self, sim_zarr_path: str, data_col: str):
 
         # true_rfi_A shape goes from (n_rfi, n_ant, n_freq, n_time) -> (n_rfi, 1, n_freq, n_time)
-        true_rfi_A = jnp.mean(read_true_rfi_A(sim_zarr_path, data_col, self.times), axis=1, keepdims=True)
+        true_rfi_A = jnp.mean(
+            read_true_rfi_A(sim_zarr_path, data_col, self.times, dtype=self.dtype.complex),
+            axis=1,
+            keepdims=True,
+        )
 
         # true_rfi_k_A is shape (n_rfi, 1, n_k_freq_rfi, n_k_time_rfi)
         # Latent prediction is mapped over axes (0, 1)
@@ -1042,18 +1051,18 @@ class FourierGPRFIConstAnt(BaseGPRFI):
             self.init_rfi_k = self.true_rfi_k_A
         elif init_type in ["zeros", 0]:
             print("Using zeros for rfi_A init")
-            ones = jnp.zeros((self.n_freq, self.n_time), dtype=complex)
+            ones = jnp.zeros((self.n_freq, self.n_time), dtype=self.dtype.complex)
             self.init_rfi_k = self.signal_to_latent(ones)[None,None,:,:] * jnp.ones((self.n_rfi, self.n_ant, 1, 1))
         elif init_type == "ones":
             print("Using ones for rfi_A init")
-            ones = jnp.ones((self.n_freq, self.n_time), dtype=complex)
+            ones = jnp.ones((self.n_freq, self.n_time), dtype=self.dtype.complex)
             self.init_rfi_k = self.signal_to_latent(ones)[None,None,:,:] * jnp.ones((self.n_rfi, self.n_ant, 1, 1))
         elif init_type == "sample":
             print("Drawing sample from prior for rfi_A init")
             base_sample = random.normal(
                 random.PRNGKey(self.r_seed),
                 (self.n_rfi, self.n_ant, self.n_k_freq_rfi, self.n_k_time_rfi),
-                dtype=complex,
+                dtype=self.dtype.complex,
             )
             self.init_rfi_k = self.forward_transform(base_sample, self.sigma_rfi_k, self.mu_rfi_k)
         else:

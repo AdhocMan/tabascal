@@ -7,6 +7,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 from .conftest import make_constants
+from tabascal.config import Precision
 
 
 def create_config(n_ant, n_rfi, n_time, n_freq, n_int_time, n_int_freq):
@@ -22,6 +23,7 @@ def create_config(n_ant, n_rfi, n_time, n_freq, n_int_time, n_int_freq):
         n_bl=a1.shape[0],
         a1=a1,
         a2=a2,
+        dtype=Precision("double"),
         args={"rfi": {"freq_int_samples": n_int_freq}},
     )
 

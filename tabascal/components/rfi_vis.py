@@ -25,6 +25,7 @@ class RiemannVisCalculation(Component):
             self.n_time = config.n_time
             self.n_bl = config.n_bl
             self.n_freq = config.n_freq
+            self.dtype = config.dtype
 
             # Validate dimensions
             self._set_outputs()
@@ -77,7 +78,7 @@ class RiemannVisCalculation(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
 
@@ -102,6 +103,7 @@ class RiemannVisTimeFreqCalculation(Component):
             self.n_time = config.n_time
             self.n_bl = config.n_bl
             self.n_freq = config.n_freq
+            self.dtype = config.dtype
 
             # Validate dimensions
             self._set_outputs()
@@ -156,7 +158,7 @@ class RiemannVisTimeFreqCalculation(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
 class RiemannVisTimeFreqCalculationFFI(Component):
@@ -182,6 +184,7 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             self.n_freq = config.n_freq
             self.n_ant = config.n_ant
             self.n_rfi = config.n_rfi
+            self.dtype = config.dtype
 
             # Validate dimensions
             self._set_outputs()
@@ -235,7 +238,7 @@ class RiemannVisTimeFreqCalculationFFI(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
 
@@ -266,6 +269,7 @@ class RiemannVisTimeFreqVariable(Component):
 
             self.time_sample_idxs = config.time_sample_idxs
             self.time_strides = config.time_strides
+            self.dtype = config.dtype
 
             # Validate dimensions
             self._set_outputs()
@@ -316,10 +320,11 @@ class RiemannVisTimeFreqVariable(Component):
         n_freq = self.n_freq
         n_groups = len(self.time_sample_idxs)
         time_strides = self.time_strides
+        c_dtype = self.dtype.complex
 
         def calculate_rfi_vis_single(rfi_A, rfi_phase, a1, a2, constants):
 
-            vis_rfi = jnp.empty((n_bl, n_freq, n_time), dtype=complex)
+            vis_rfi = jnp.empty((n_bl, n_freq, n_time), dtype=c_dtype)
             for i, time_stride in zip(range(n_groups), time_strides):
                 idx = constants[f"{prefix}/time_sample_idxs_{i}"]
                 vis_rfi = vis_rfi.at[idx].set(
@@ -364,5 +369,5 @@ class RiemannVisTimeFreqVariable(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }

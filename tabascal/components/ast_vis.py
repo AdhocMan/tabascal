@@ -34,6 +34,7 @@ class FourierTimeAst(Component):
             self.n_time = config.n_time
             self.n_bl = config.n_bl
             self.n_freq = config.n_freq
+            self.dtype = config.dtype
             self.int_time = config.int_time
             self.dish_d = config.dish_d
             self.uvw = config.uvw
@@ -159,12 +160,12 @@ class FourierTimeAst(Component):
         sqrt_Pk = lambda k0: jnp.sqrt(pow_spec(self.k_ast, self.p0, k0, self.gamma))
 
         self.sigma_ast_k = vmap(vmap(sqrt_Pk, (0), (0)), (1), (1))(self.ast_fr)
-        self.mu_ast_k = jnp.zeros((self.n_bl, self.n_freq, self.n_ast_k), dtype=complex)
+        self.mu_ast_k = jnp.zeros((self.n_bl, self.n_freq, self.n_ast_k), dtype=self.dtype.complex)
 
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -189,7 +190,7 @@ class FourierTimeAst(Component):
             prior_sample = random.normal(
                 random.PRNGKey(1),
                 (self.n_bl, self.n_freq, self.n_ast_k),
-                dtype=complex,
+                dtype=self.dtype.complex,
             )
             self.init_ast_k = self.forward_transform(
                 prior_sample, self.sigma_ast_k, self.mu_ast_k
@@ -239,6 +240,7 @@ class FourierTimeConstFreqAst(Component):
             self.n_time = config.n_time
             self.n_bl = config.n_bl
             self.n_freq = config.n_freq
+            self.dtype = config.dtype
             self.int_time = config.int_time
             self.dish_d = config.dish_d
             self.uvw = config.uvw
@@ -359,12 +361,12 @@ class FourierTimeConstFreqAst(Component):
         sqrt_Pk = lambda k0: jnp.sqrt(pow_spec(self.k_ast, self.p0, k0, self.gamma))
 
         self.sigma_ast_k = vmap(vmap(sqrt_Pk, (0), (0)), (1), (1))(self.ast_fr)
-        self.mu_ast_k = jnp.zeros((self.n_bl, self.n_freq, self.n_ast_k), dtype=complex)
+        self.mu_ast_k = jnp.zeros((self.n_bl, self.n_freq, self.n_ast_k), dtype=self.dtype.complex)
 
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -389,7 +391,7 @@ class FourierTimeConstFreqAst(Component):
             prior_sample = random.normal(
                 random.PRNGKey(1),
                 (self.n_bl, self.n_freq, self.n_ast_k),
-                dtype=complex,
+                dtype=self.dtype.complex,
             )
             self.init_ast_k = self.forward_transform(
                 prior_sample, self.sigma_ast_k, self.mu_ast_k
@@ -439,6 +441,7 @@ class FourierTimeFreqAst(Component):
             self.n_time = config.n_time
             self.n_bl = config.n_bl
             self.n_freq = config.n_freq
+            self.dtype = config.dtype
             self.int_time = config.int_time
             self.dish_d = config.dish_d
             self.uvw = config.uvw
@@ -594,12 +597,12 @@ class FourierTimeFreqAst(Component):
             self.sigma_ast_k = self.sigma_ast_k.at[:, 1:, :].set(
                 self.sigma_ast_k[:, 1:, :] * 1e-6
             )
-        self.mu_ast_k = jnp.zeros((self.n_bl, self.n_freq, self.n_ast_k), dtype=complex)
+        self.mu_ast_k = jnp.zeros((self.n_bl, self.n_freq, self.n_ast_k), dtype=self.dtype.complex)
 
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -624,7 +627,7 @@ class FourierTimeFreqAst(Component):
             prior_sample = random.normal(
                 random.PRNGKey(1),
                 (self.n_bl, self.n_freq, self.n_ast_k),
-                dtype=complex,
+                dtype=self.dtype.complex,
             )
             self.init_ast_k = self.forward_transform(
                 prior_sample, self.sigma_ast_k, self.mu_ast_k
@@ -677,6 +680,7 @@ class FourierTimeFreqGPAst(Component):
             self.n_time = config.n_time
             self.n_bl = config.n_bl
             self.n_freq = config.n_freq
+            self.dtype = config.dtype
             self.int_time = config.int_time
             self.chan_width = config.chan_width
             self.dish_d = config.dish_d
@@ -858,7 +862,7 @@ class FourierTimeFreqGPAst(Component):
         elif prior_type in ["zeros", 0]:
             print("Using zeros for AST prior mean")
             self.mu_ast_k = jnp.zeros(
-                (self.n_bl, self.n_k_freq_ast, self.n_k_time_ast), dtype=complex
+                (self.n_bl, self.n_k_freq_ast, self.n_k_time_ast), dtype=self.dtype.complex
             )
         else:
             raise ValueError(f"Provided prior type: {prior_type} is not valid. Choose from (data, zeros).")
@@ -866,7 +870,7 @@ class FourierTimeFreqGPAst(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=self.dtype.complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -903,7 +907,7 @@ class FourierTimeFreqGPAst(Component):
             prior_sample = random.normal(
                 random.PRNGKey(1),
                 (self.n_bl, self.n_k_freq_ast, self.n_k_time_ast),
-                dtype=complex,
+                dtype=self.dtype.complex,
             )
             self.init_ast_k = self.forward_transform(
                 prior_sample, self.sigma_ast_k, self.mu_ast_k
