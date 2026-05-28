@@ -15,11 +15,19 @@ def base_kernel(x_in, x_out, var, l):
 
 def cholesky(x_in, var, l, noise=1e-8):
 
-    L = jnp.linalg.cholesky(
-        base_kernel(x_in, x_in, var, l) + noise * jnp.eye(x_in.shape[0])
+    # Done in float64: the `noise` jitter (default 1e-8) is below float32 eps
+    # (~1.2e-7), so single-precision Cholesky operates on a near-singular
+    # kernel matrix and produces unstable factors.
+    out_dtype = jnp.result_type(x_in, var, l)
+    K = base_kernel(
+        x_in.astype(jnp.float64),
+        x_in.astype(jnp.float64),
+        jnp.float64(var),
+        jnp.float64(l),
     )
+    L = jnp.linalg.cholesky(K + noise * jnp.eye(x_in.shape[0], dtype=jnp.float64))
 
-    return L
+    return L.astype(out_dtype)
 
 
 def kernel(x, x_, var, l, noise=1e-3):
@@ -35,9 +43,17 @@ def kernel(x, x_, var, l, noise=1e-3):
 
 
 def resampling_kernel(x, x_, var, l, noise=1e-3):
-    K_inv = jnp.linalg.inv(kernel(x, x, var, l, noise))
-    K_s = kernel(x, x_, var, l)
-    return K_s @ K_inv
+    # Done in float64: matrix inversion of the GP kernel is precision-sensitive
+    # — float32 errors propagate into the resampling weights and corrupt the
+    # gain solution.
+    out_dtype = jnp.result_type(x, x_, var, l)
+    x64 = x.astype(jnp.float64)
+    x_64 = x_.astype(jnp.float64)
+    var64 = jnp.float64(var)
+    l64 = jnp.float64(l)
+    K_inv = jnp.linalg.inv(kernel(x64, x64, var64, l64, noise))
+    K_s = kernel(x64, x_64, var64, l64)
+    return (K_s @ K_inv).astype(out_dtype)
 
 
 def get_times(times, gp_l):

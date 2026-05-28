@@ -168,7 +168,10 @@ def read_ms(
     chan_width = jnp.array(xds_spec.CHAN_WIDTH.data[0, 0].compute(), dtype=f_dtype)
     int_time = jnp.asarray(xds.INTERVAL.data[0].compute(), dtype=f_dtype)
 
-    times_mjd = jnp.array(xds.TIME.data.reshape(n_time, n_bl)[:, 0].compute(), dtype=f_dtype)
+    # Absolute MJD timestamps require float64; float32 (~7 digits) cannot
+    # represent MS TIME values (~5e9 s) with sub-second resolution and ERFA
+    # rejects the rounded dates as "unacceptable".
+    times_mjd = jnp.array(xds.TIME.data.reshape(n_time, n_bl)[:, 0].compute(), dtype=jnp.float64)
     if times_mjd[1] - times_mjd[0] > 0.5:
         times_mjd = times_mjd / (24 * 3600)
 

@@ -1,7 +1,7 @@
 #####################
 # Compute parameters
 #####################
-precision: double       # Optional - 'single' or 'double'. Selects float32/complex64 vs float64/complex128 for arrays.
+precision: single       # Optional - 'single' or 'double'. Selects float32/complex64 vs float64/complex128 for arrays.
 ##################
 # Data parameters
 ##################

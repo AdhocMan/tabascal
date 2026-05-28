@@ -168,7 +168,9 @@ class TabConfig:
 
         self.int_time = ms_params["int_time"]
         self.times = np.asarray(ms_params["times"], dtype=f_dtype)
-        self.times_jd = mjd_to_jd(ms_params["times_mjd"]).astype(f_dtype)
+        # Absolute JD timestamps are kept in float64 regardless of precision
+        # mode; see read_ms() for rationale.
+        self.times_jd = mjd_to_jd(ms_params["times_mjd"]).astype(jnp.float64)
 
         self.chan_width = ms_params["chan_width"]
         self.freqs = np.asarray(ms_params["freqs"], dtype=f_dtype)
@@ -248,9 +250,9 @@ class TabConfig:
         self.times_fine = times_fine.astype(f_dtype)
         self.n_freq_fine = len(self.freqs_fine)
         self.n_time_fine = len(self.times_fine)
-        self.times_jd_fine = (
-            self.times_jd[0] + secs_to_days(self.times_fine)
-        ).astype(f_dtype)
+        self.times_jd_fine = self.times_jd[0] + secs_to_days(
+            self.times_fine.astype(jnp.float64)
+        )
 
     def get_orbital_elements(self, norad_ids: List[int], extra_tle_dir: Optional[str] = None):
 

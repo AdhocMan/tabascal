@@ -27,6 +27,13 @@ def get_rfi_phase(
         Phase at each antenna for each source over time.
     """
     c = 299792458.0
+    # Phase wrapping `(dist / lambda) % 1` needs float64: dist/lambda can be
+    # ~1e7 and float32's ~7 decimal digits would erase the fractional part.
+    out_dtype = rfi_xyz.dtype
+    rfi_xyz = rfi_xyz.astype(jnp.float64)
+    ants_xyz = ants_xyz.astype(jnp.float64)
+    ants_uvw = ants_uvw.astype(jnp.float64)
+    freqs = freqs.astype(jnp.float64)
     lamda = c / freqs[None, None, :, None]
 
     distances = jnp.linalg.norm(
@@ -36,7 +43,7 @@ def get_rfi_phase(
 
     phases = -2.0 * jnp.pi * fringe_dist
 
-    return phases
+    return phases.astype(out_dtype)
 
 
 def calculate_rfi_vis_fine(
