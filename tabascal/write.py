@@ -11,6 +11,12 @@ import dask
 
 @measure_runtime
 def write_results_ms(ms_path: str, results_zarr_path: str, data_col: str = "DATA"):
+    from tabascal.distributed import is_process_0
+
+    # Pure host I/O (reads the zarr process 0 just wrote, writes the MS). Under the
+    # multi-process solve only process 0 owns the filesystem write; workers return.
+    if not is_process_0():
+        return
 
     xds_ms = xds_from_ms(ms_path)[0]
     xds_tab = xr.open_zarr(results_zarr_path)
@@ -91,10 +97,27 @@ def write_results_ms(ms_path: str, results_zarr_path: str, data_col: str = "DATA
     dask.compute(xds_to_table([xds_ms], ms_path, cols, column_keywords=col_keywords))
 
 
-@measure_runtime 
+@measure_runtime
 def write_results_xds(
     vi_pred: dict, tab_config, file_path: str, overwrite: bool = True
 ):
+    from tabascal import distributed as dist
+
+    # Gather any baseline-sharded predictions to a full host array and drop the padding
+    # baselines added for the distributed solve (slice back to the true count). On one
+    # device this is just ``np.asarray`` and ``n_bl_true == n_bl`` so nothing is sliced.
+    n_bl_true = getattr(tab_config, "n_bl_true", None)
+
+    def _vis(key):
+        arr = dist.to_host(vi_pred[key])
+        return arr[:, :n_bl_true] if n_bl_true is not None else arr
+
+    vi_pred = {
+        "vis_rfi": _vis("vis_rfi"),
+        "vis_ast": _vis("vis_ast"),
+        "vis_obs": _vis("vis_obs"),
+        "gains": dist.to_host(vi_pred["gains"]),
+    }
 
     # print(vi_pred.keys())
     # print(vi_pred["rfi_vis"].shape)
@@ -133,6 +156,11 @@ def write_results_xds(
 
     mode = "w" if overwrite else "w-"
 
-    map_xds.to_zarr(file_path, mode=mode)
+    # The to_host() gathers above are collectives that must run on every process; the
+    # actual store is done once, on process 0, to a shared filesystem.
+    from tabascal.distributed import is_process_0
+
+    if is_process_0():
+        map_xds.to_zarr(file_path, mode=mode)
 
     return map_xds

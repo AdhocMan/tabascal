@@ -49,12 +49,12 @@ class RFIVisOp:
     def eval(self, rfi_amp_fine, rfi_phase):
         """
         Evaluate the RFI visibility for given RFI amplitudes and phases.
-        
+
         Args:
             rfi_amp_fine: Fine-grained RFI amplitude array with shape
                          (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
             rfi_phase: RFI phase array with shape matching rfi_amp_fine.
-        
+
         Returns:
             Array of RFI visibilities with shape (n_baselines, n_freq, n_time).
         """
@@ -63,6 +63,50 @@ class RFIVisOp:
             self.a2, self.a2_sorter, self.a2_start,
             rfi_amp_fine, rfi_phase
         )
+
+
+def _rfi_vis_eval(n_ant, a1, a2, rfi_amp_fine, rfi_phase):
+    """RFI visibility from *traced* per-baseline ``a1``/``a2`` (no captured constants).
+
+    Recomputes the sorter/start lookups from the supplied ``a1``/``a2`` rather than
+    capturing them as XLA constants, so the result is correct for whatever baseline
+    block ``a1``/``a2`` represent. Output is ``(len(a1), n_freq, n_time)``.
+    """
+    a1_sorter, a1_start, a2_sorter, a2_start = prepare_indices(n_ant, a1, a2)
+    return rfi_vis_op.bind(
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
+    )
+
+
+def rfi_vis_sharded(n_ant, a1, a2, rfi_amp_fine, rfi_phase, mesh=None):
+    """Baseline-sharded RFI visibility for the distributed (multi-GPU) solve.
+
+    The custom FFI primitive is opaque to XLA's GSPMD partitioner, so we drive it
+    with :func:`jax.shard_map`: ``a1``/``a2`` and the output are sharded along the
+    baseline axis (``P(BL_AXIS)``) while the per-antenna ``rfi_amp_fine``/``rfi_phase``
+    are replicated (``P()``). The op is embarrassingly parallel across baselines --
+    each shard runs the kernel on its own ``a1``/``a2`` block with **no collective** --
+    so the per-shard function is just :func:`_rfi_vis_eval`, and its existing JVP and
+    transpose rules differentiate per shard automatically.
+
+    ``mesh=None`` (single device) takes the original unsharded path unchanged.
+    """
+    from functools import partial
+
+    if mesh is None:
+        return _rfi_vis_eval(n_ant, a1, a2, rfi_amp_fine, rfi_phase)
+
+    from tabascal.distributed import BL_AXIS
+    from jax.sharding import PartitionSpec as P
+
+    bl = P(BL_AXIS)
+    return jax.shard_map(
+        partial(_rfi_vis_eval, n_ant),
+        mesh=mesh,
+        in_specs=(bl, bl, P(), P()),
+        out_specs=bl,
+        check_vma=False,
+    )(a1, a2, rfi_amp_fine, rfi_phase)
 
 
 def prepare_indices(n_ant, a1, a2):

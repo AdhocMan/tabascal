@@ -10,6 +10,7 @@ from tabascal.interferometry import (
 )
 from tabascal.fft_gp import domain_ss
 from tabascal.time import secs_to_days, mjd_to_jd, jd_to_mjd, gast_deg
+from tabascal import distributed as dist
 
 import jax.numpy as jnp
 
@@ -153,6 +154,45 @@ class TabConfig:
         )
 
         self._set_freqs_times()
+
+        self._partition_baselines()
+
+    def _partition_baselines(self):
+        """Set up baseline sharding for the distributed (multi-GPU) solve.
+
+        On a single device this is a no-op: ``mesh``/``part`` are ``None`` and the
+        baseline count is unchanged. With several devices visible we pad the baseline
+        axis up to a multiple of the device count (an even ``NamedSharding`` requires
+        it) and bump ``n_bl`` to the padded count, which every per-baseline shape
+        downstream then uses. The padding baselines are zero-valued and **flagged**
+        (excluded from the likelihood, ``set_flags``/``reduced_chi2`` convention), and
+        are sliced away before any result is written.
+        """
+        self.n_bl_true = self.n_bl
+        self.mesh = None
+        self.part = None
+
+        if not dist.sharding_enabled():
+            return
+
+        part = dist.bl_partition(self.n_bl)
+        n_pad = part.n_bl_padded - self.n_bl
+        self.mesh = dist.make_bl_mesh()
+        self.part = part
+
+        if n_pad:
+            # vis_obs / flags: (n_bl, n_freq, n_time) -> pad baseline axis 0.
+            self.vis_obs = jnp.pad(self.vis_obs, ((0, n_pad), (0, 0), (0, 0)))
+            self.flags = jnp.pad(
+                self.flags, ((0, n_pad), (0, 0), (0, 0)), constant_values=True
+            )
+            # uvw: (n_time, n_bl, 3) -> pad baseline axis 1.
+            self.uvw = jnp.pad(self.uvw, ((0, 0), (0, n_pad), (0, 0)))
+            # a1 / a2: (n_bl,) -> pad with antenna 0 (harmless; these baselines flagged).
+            self.a1 = jnp.pad(self.a1, (0, n_pad))
+            self.a2 = jnp.pad(self.a2, (0, n_pad))
+
+        self.n_bl = part.n_bl_padded
 
     def set_noise(self, noise: float):
 
@@ -312,6 +352,31 @@ class Model:
 
         self.forward = self.build_forward()
         self.prob_model = self.build_prob_model()
+
+        self._shard_for_distributed(tab_config)
+
+    def _shard_for_distributed(self, tab_config):
+        """Place every model array on the device mesh for the distributed solve.
+
+        Per-baseline leaves (``vis_*`` state, ``ast_k_*`` params,
+        ``sigma_ast_k``/``mu_ast_k`` and ``a1``/``a2`` constants) are sharded along the
+        baseline axis; per-antenna params, GP kernels and scalars are replicated --
+        decided purely by leading-dim == ``n_bl`` in :func:`distributed.put_leaf`. The
+        observed visibilities and flags on ``tab_config`` are sharded too: ``vis_obs``
+        is the optimizer's ``obs_data`` and ``flags`` is read lazily by the likelihood
+        closure, so both must match the prediction's baseline sharding. No-op on one
+        device (``mesh is None``).
+        """
+        mesh = getattr(tab_config, "mesh", None)
+        if mesh is None:
+            return
+
+        n_bl = tab_config.n_bl
+        self.init_params = dist.shard_pytree(self.init_params, n_bl, mesh)
+        self.state = dist.shard_pytree(self.state, n_bl, mesh)
+        self.constants = dist.shard_pytree(self.constants, n_bl, mesh)
+        tab_config.vis_obs = dist.put_leaf(tab_config.vis_obs, n_bl, mesh)
+        tab_config.flags = dist.put_leaf(tab_config.flags, n_bl, mesh)
 
     def build_forward(self):
         forwards = [comp.build_forward() for comp in self.components]

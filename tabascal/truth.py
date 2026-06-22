@@ -200,11 +200,20 @@ def load_truth(tab_config) -> Dict[str, jnp.ndarray]:
     if not path or not os.path.exists(path):
         return truth
 
+    # Under the distributed solve the prediction's baseline axis is padded up to a
+    # multiple of the device count (TabConfig._partition_baselines); pad the truth to
+    # match so the (padded) prediction minus truth and the (padded) flag mask all line
+    # up. Padding baselines are flagged, so they drop out of every masked metric. On
+    # one device n_bl == n_bl (no padding) and this is a no-op.
+    def _pad_bl0(arr):
+        pad = n_bl - arr.shape[0]
+        return jnp.pad(arr, ((0, pad), (0, 0), (0, 0))) if pad > 0 else arr
+
     have = available_truth(tab_config.args)
     if have["vis_ast"]:
-        truth["vis_ast"] = read_true_vis_ast(path)
+        truth["vis_ast"] = _pad_bl0(read_true_vis_ast(path))
     if have["vis_rfi"]:
-        truth["vis_rfi"] = read_true_vis_rfi(path)
+        truth["vis_rfi"] = _pad_bl0(read_true_vis_rfi(path))
     if have["gains"]:
         gains = read_true_gains(path)
         if gains is not None:

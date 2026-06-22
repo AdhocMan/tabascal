@@ -183,10 +183,15 @@ def _print_model_summary(tab_config, model, start_time):
 
 @measure_runtime
 def tabascal_subtraction(config, sim_dir, ms_path=None, suffix="", extra_tle_dir=None, log=True):
+    from tabascal.distributed import is_process_0, suppress_worker_stdout
+
     paths = _resolve_paths(config, sim_dir, ms_path, suffix, extra_tle_dir)
     ms_path = paths.ms_path
 
-    with _stdout_logger(paths.log_path, log):
+    # Only process 0 logs/prints; workers silence stdout so the console and the log
+    # file are not N-times duplicated. (No-op when single-process.)
+    log_ctx = _stdout_logger(paths.log_path, log) if is_process_0() else suppress_worker_stdout()
+    with log_ctx:
         start_time = datetime.now()
         key, _ = random.split(random.PRNGKey(1))
 
@@ -210,12 +215,12 @@ def tabascal_subtraction(config, sim_dir, ms_path=None, suffix="", extra_tle_dir
         print(f"log_l : {nlog_l:.3e}")
         print(f"log_p : {nlog_p:.3e}")
 
-        if config["plots"]["init"]:
+        if config["plots"]["init"] and is_process_0():
             from tabascal.plot import plot_init
             plot_init(tab_config, init_pred, truth, paths.model_name, paths.plot_dir)
 
         key, subkey = random.split(key)
-        if config["plots"]["prior"]:
+        if config["plots"]["prior"] and is_process_0():
             from tabascal.plot import plot_prior
             plot_prior(tab_config, prob_model, truth, paths.model_name, subkey, paths.plot_dir, state=model.state, constants=model.constants)
 
@@ -226,11 +231,11 @@ def tabascal_subtraction(config, sim_dir, ms_path=None, suffix="", extra_tle_dir
                 state=model.state, constants=model.constants, truth=truth,
             )
 
-            if config["plots"]["opt"]:
+            if config["plots"]["opt"] and is_process_0():
                 from tabascal.plot import plot_opt
                 plot_opt(tab_config, vi_pred, truth, paths.model_name, paths.plot_dir)
 
-            if config["plots"]["losses"]:
+            if config["plots"]["losses"] and is_process_0():
                 from tabascal.plot import plot_losses
                 plot_losses(losses, paths.model_name, paths.plot_dir)
 
@@ -246,12 +251,13 @@ def tabascal_subtraction(config, sim_dir, ms_path=None, suffix="", extra_tle_dir
             print(f"Copying tabascal initial values to MS file from {paths.init_pred_path}")
             write_results_ms(ms_path, paths.init_pred_path, tab_config.args["data"]["data_col"])
 
-    if log:
+    if log and is_process_0():
         shutil.copy(paths.log_path, paths.plot_dir)
         os.remove(paths.log_path)
 
-    with open(os.path.join(paths.plot_dir, f"tab_config_{paths.run_id}.yaml"), "w") as fp:
-        yaml.dump(config, fp)
+    if is_process_0():
+        with open(os.path.join(paths.plot_dir, f"tab_config_{paths.run_id}.yaml"), "w") as fp:
+            yaml.dump(config, fp)
 
 
 def set_precision(config):
@@ -284,6 +290,11 @@ def set_precision(config):
 
 
 def run(args):
+    # Bring up the JAX distributed runtime first (no-op outside SLURM / single
+    # process); must precede any JAX array creation or device use.
+    from tabascal.distributed import init_distributed
+    init_distributed()
+
     if args.timings:
         enable_timings()
 

@@ -3,7 +3,7 @@ from jax import vmap
 
 from tabascal.interferometry import calculate_rfi_vis_fine, calculate_rfi_vis_variable
 from tabascal.components import Component
-from tabascal.components.ffi.rfi_vis_op import RFIVisOp
+from tabascal.components.ffi.rfi_vis_op import RFIVisOp, rfi_vis_sharded  # noqa: F401 (RFIVisOp re-exported for tests)
 
 
 class RiemannVisCalculation(Component):
@@ -182,6 +182,8 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             self.n_freq = config.n_freq
             self.n_ant = config.n_ant
             self.n_rfi = config.n_rfi
+            # Baseline-sharding mesh for the distributed solve (None on one device).
+            self.mesh = getattr(config, "mesh", None)
 
             # Validate dimensions
             self._set_outputs()
@@ -202,19 +204,27 @@ class RiemannVisTimeFreqCalculationFFI(Component):
 
         return set_params
 
+    def build_constants(self):
+        # a1/a2 are routed through constants (not captured in the op closure) so they
+        # arrive as baseline-sharded *traced* inputs under the distributed solve.
+        return {"a1": self.a1, "a2": self.a2}
+
     def build_forward(self):
         """Return pure, JIT-compatible function"""
         # Pre-compute everything possible
+        prefix = self.prefix
         n_int_time = self.n_int_time
         n_int_freq = self.n_int_freq
         n_time = self.n_time
-        n_bl = self.n_bl
         n_freq = self.n_freq
         n_rfi = self.n_rfi
         n_ant = self.n_ant
-        op = RFIVisOp(n_ant, self.a1, self.a2)
+        mesh = self.mesh
 
         def forward(params, state, constants):
+            a1 = constants[f"{prefix}/a1"]
+            a2 = constants[f"{prefix}/a2"]
+
             new_shape = (n_rfi, n_ant, n_freq, n_int_freq, n_time, n_int_time)
             rfi_amp_fine = state["rfi_A"].reshape(new_shape)
             rfi_phase = state["rfi_phase"].reshape(new_shape)
@@ -223,7 +233,8 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             rfi_amp_fine = jnp.transpose(rfi_amp_fine , (1, 2, 4, 0, 3, 5))
             rfi_phase = jnp.transpose(rfi_phase, (1, 2, 4, 0, 3, 5))
 
-            vis_rfi = op.eval(rfi_amp_fine, rfi_phase)
+            # Per-baseline output, sharded along the baseline axis when mesh is set.
+            vis_rfi = rfi_vis_sharded(n_ant, a1, a2, rfi_amp_fine, rfi_phase, mesh=mesh)
 
             state = {**state, "vis_rfi": state["vis_rfi"] + vis_rfi}
 

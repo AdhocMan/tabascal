@@ -122,3 +122,26 @@ The `tabascal` script also has a help context whcih can be accessed with
 ```bash
 tabascal -h
 ```
+
+## Running on Multiple GPUs
+
+A single `tabascal run` can be solved across several GPUs, with one process per GPU,
+to speed up the optimization and to fit problems too large for a single GPU's memory.
+The MAP solve is sharded along the **baseline** axis: the per-baseline arrays
+(visibilities, astronomical Gaussian-process parameters) are split across the GPUs
+while the per-antenna parameters (RFI signal, gains) are replicated. The result is one
+*exact* solution — identical to a single-device run — with the compute and memory
+distributed across the devices/nodes.
+
+This turns on **automatically** whenever more than one device is visible: tabascal
+calls `jax.distributed.initialize()`, which auto-detects the SLURM coordinator, the
+process count and the rank. There is no extra flag. Launch with **one task per GPU**
+(`--gpus-per-task=1`):
+
+```bash
+srun --nodes=1 --ntasks-per-node=4 --gpus-per-task=1 \
+    tabascal run -c tab_target.yaml -s data/<sim_dir>
+```
+
+A ready-to-edit batch script is provided at `examples/slurm_tabascal_run.sh`. The same
+launch scales unchanged across multiple nodes (increase `--nodes`).

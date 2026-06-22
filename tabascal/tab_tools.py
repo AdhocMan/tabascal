@@ -455,12 +455,17 @@ def run_custom_svi(
     AutoDelta SVI for MAP estimation.
     """
     def _run_phase(params, epsilon, max_iter):
+        from tabascal.distributed import is_process_0
+
         optimizer = optax.adabelief(epsilon)
         opt_state = optimizer.init(params)
         losses = []
         window = max(max_iter // 10, 1)
         init_loss = None
-        pbar = trange(max_iter)
+        # Every process runs the identical iteration count and _map_step (which carries
+        # the cross-shard all-reduce); only process 0 draws the progress bar.
+        show = is_process_0()
+        pbar = trange(max_iter) if show else range(max_iter)
         for i in pbar:
             params, opt_state, loss = _map_step(
                 prob_model, optimizer, params, opt_state, state, constants, obs_data
@@ -473,10 +478,11 @@ def run_custom_svi(
             avg_loss = sum(losses[start_idx:]) / len(losses[start_idx:])
             n1 = start_idx + 1
             n2 = i + 1
-            pbar.set_postfix_str(
-                f"init loss: {init_loss:.4f}, avg. loss [{n1}-{n2}]: {avg_loss:.4f}",
-                refresh=False,
-            )
+            if show:
+                pbar.set_postfix_str(
+                    f"init loss: {init_loss:.4f}, avg. loss [{n1}-{n2}]: {avg_loss:.4f}",
+                    refresh=False,
+                )
         return params, losses
 
     params = init_params
