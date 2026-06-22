@@ -117,7 +117,10 @@ def rfi_signal_config_validation(rfi_config: Dict, vis_obs: Array, freqs: Array,
         raise ValueError(f"Config parameter (rfi:\n\tr_seed: {r_seed}) is not of type int.")
 
     if not gp_var: # Set Default
-        est_gp_var = float(jnp.max(jnp.abs(vis_obs)))
+        # Global max over all processes' baseline blocks (sets the RFI GP variance, a
+        # prior scalar that must match across processes); no-op single-process.
+        from tabascal import distributed as dist
+        est_gp_var = dist.all_max(jnp.max(jnp.abs(vis_obs)))
         rfi_config["var"] = est_gp_var
     elif isinstance(gp_var, (float, int)):
         rfi_config["var"] = float(gp_var)

@@ -23,7 +23,8 @@ class RiemannVisCalculation(Component):
             self.a2 = config.a2
             self.n_int_time = config.n_int_time
             self.n_time = config.n_time
-            self.n_bl = config.n_bl
+            self.n_bl = config.n_bl  # GLOBAL (padded) count for traced forward shapes
+            self.n_bl_local = getattr(config, "n_bl_local", config.n_bl)
             self.n_freq = config.n_freq
 
             # Validate dimensions
@@ -77,7 +78,7 @@ class RiemannVisCalculation(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl_local, self.n_freq, self.n_time), dtype=complex),
         }
 
 
@@ -100,7 +101,8 @@ class RiemannVisTimeFreqCalculation(Component):
             # self.n_int_freq = config.n_int_freq
             self.n_int_freq = config.args["rfi"]["freq_int_samples"]
             self.n_time = config.n_time
-            self.n_bl = config.n_bl
+            self.n_bl = config.n_bl  # GLOBAL (padded) count for traced forward shapes
+            self.n_bl_local = getattr(config, "n_bl_local", config.n_bl)
             self.n_freq = config.n_freq
 
             # Validate dimensions
@@ -156,7 +158,7 @@ class RiemannVisTimeFreqCalculation(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl_local, self.n_freq, self.n_time), dtype=complex),
         }
 
 class RiemannVisTimeFreqCalculationFFI(Component):
@@ -178,7 +180,8 @@ class RiemannVisTimeFreqCalculationFFI(Component):
             # self.n_int_freq = config.n_int_freq
             self.n_int_freq = config.args["rfi"]["freq_int_samples"]
             self.n_time = config.n_time
-            self.n_bl = config.n_bl
+            self.n_bl = config.n_bl  # GLOBAL (padded) count for traced forward shapes
+            self.n_bl_local = getattr(config, "n_bl_local", config.n_bl)
             self.n_freq = config.n_freq
             self.n_ant = config.n_ant
             self.n_rfi = config.n_rfi
@@ -245,7 +248,7 @@ class RiemannVisTimeFreqCalculationFFI(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl_local, self.n_freq, self.n_time), dtype=complex),
         }
 
 
@@ -271,7 +274,8 @@ class RiemannVisTimeFreqVariable(Component):
             self.n_rfi = config.n_rfi
             self.n_ant = config.n_ant
             self.n_time = config.n_time
-            self.n_bl = config.n_bl
+            self.n_bl = config.n_bl  # GLOBAL (padded) count for traced forward shapes
+            self.n_bl_local = getattr(config, "n_bl_local", config.n_bl)
             self.n_freq = config.n_freq
 
             self.time_sample_idxs = config.time_sample_idxs
@@ -374,5 +378,5 @@ class RiemannVisTimeFreqVariable(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_rfi": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_rfi": jnp.zeros((self.n_bl_local, self.n_freq, self.n_time), dtype=complex),
         }

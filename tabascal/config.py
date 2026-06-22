@@ -168,31 +168,36 @@ class TabConfig:
         (excluded from the likelihood, ``set_flags``/``reduced_chi2`` convention), and
         are sliced away before any result is written.
         """
-        self.n_bl_true = self.n_bl
+        self.n_bl_true = self.n_bl  # read_ms always reports the total baseline count
         self.mesh = None
         self.part = None
+        self.n_bl_local = self.n_bl
 
         if not dist.sharding_enabled():
             return
 
-        part = dist.bl_partition(self.n_bl)
-        n_pad = part.n_bl_padded - self.n_bl
+        # Multi-process: reuse the partition computed for the local-block read.
+        # Single-process: the whole (padded) baseline axis lives on one process.
+        part = self._pre_part if self._pre_part is not None else dist.bl_partition(self.n_bl)
         self.mesh = dist.make_bl_mesh()
         self.part = part
 
+        # The per-baseline arrays currently hold this process's real baselines (a block
+        # in multi-process, all of them in single-process). Pad up to local_rows -- the
+        # padded rows are zero-valued and flagged out of the likelihood, and sliced away
+        # before any result is written.
+        n_pad = part.local_rows - self.vis_obs.shape[0]
         if n_pad:
-            # vis_obs / flags: (n_bl, n_freq, n_time) -> pad baseline axis 0.
             self.vis_obs = jnp.pad(self.vis_obs, ((0, n_pad), (0, 0), (0, 0)))
             self.flags = jnp.pad(
                 self.flags, ((0, n_pad), (0, 0), (0, 0)), constant_values=True
             )
-            # uvw: (n_time, n_bl, 3) -> pad baseline axis 1.
             self.uvw = jnp.pad(self.uvw, ((0, 0), (0, n_pad), (0, 0)))
-            # a1 / a2: (n_bl,) -> pad with antenna 0 (harmless; these baselines flagged).
-            self.a1 = jnp.pad(self.a1, (0, n_pad))
+            self.a1 = jnp.pad(self.a1, (0, n_pad))  # antenna 0; harmless, flagged
             self.a2 = jnp.pad(self.a2, (0, n_pad))
 
-        self.n_bl = part.n_bl_padded
+        self.n_bl = part.n_bl_padded  # GLOBAL padded count: every traced shape uses this
+        self.n_bl_local = part.local_rows  # rows this process actually holds / builds
 
     def set_noise(self, noise: float):
 
@@ -208,7 +213,20 @@ class TabConfig:
 
     def read_ms_params(self, freq: float, corr: str, data_col: str):
 
-        ms_params = read_ms(self.ms_path, freq, None, corr, data_col)
+        # Multi-process distributed solve: read only this process's baseline block so
+        # host memory scales (Phase B). The partition is computed from a metadata-only
+        # baseline-count probe. Single-process (incl. single-node multi-GPU) reads the
+        # whole MS and shards onto devices later.
+        bl_block = None
+        self._pre_part = None
+        import jax
+        if dist.sharding_enabled() and jax.process_count() > 1:
+            from tabascal.tab_tools import probe_n_bl
+            n_bl_total = probe_n_bl(self.ms_path, data_col)
+            self._pre_part = dist.bl_partition(n_bl_total)
+            bl_block = (self._pre_part.start, self._pre_part.valid_stop)
+
+        ms_params = read_ms(self.ms_path, freq, None, corr, data_col, bl_block=bl_block)
 
         self.phase_centre = {"ra": ms_params["ra"], "dec": ms_params["dec"]}
         self.dish_d = ms_params["dish_d"]
@@ -263,7 +281,10 @@ class TabConfig:
         # fringe_freq is shape (n_rfi, n_time_coarse, n_bl)
         fringe_freq = np.array([get_fringe_freq(rfi_pos) for rfi_pos in rfi_xyz])
 
-        self.max_rfi_vis = np.max(np.abs(self.vis_obs))
+        # Global max over all processes' baseline blocks: this sets the integration
+        # sample count (n_int_time), which fixes fine-grid array shapes and so must be
+        # identical on every process. No-op single-process.
+        self.max_rfi_vis = dist.all_max(np.max(np.abs(self.vis_obs)))
         sample_freq_bl = (
             np.pi
             * np.max(np.abs(fringe_freq), axis=(0, 1))
@@ -371,12 +392,14 @@ class Model:
         if mesh is None:
             return
 
-        n_bl = tab_config.n_bl
-        self.init_params = dist.shard_pytree(self.init_params, n_bl, mesh)
-        self.state = dist.shard_pytree(self.state, n_bl, mesh)
-        self.constants = dist.shard_pytree(self.constants, n_bl, mesh)
-        tab_config.vis_obs = dist.put_leaf(tab_config.vis_obs, n_bl, mesh)
-        tab_config.flags = dist.put_leaf(tab_config.flags, n_bl, mesh)
+        # Each process contributes its own per-baseline block; shard_bl assembles the
+        # global (padded) jax.Arrays. Per-antenna params / scalars are replicated.
+        part = tab_config.part
+        self.init_params = dist.shard_pytree(self.init_params, part, mesh)
+        self.state = dist.shard_pytree(self.state, part, mesh)
+        self.constants = dist.shard_pytree(self.constants, part, mesh)
+        tab_config.vis_obs = dist.put_leaf(tab_config.vis_obs, part, mesh)
+        tab_config.flags = dist.put_leaf(tab_config.flags, part, mesh)
 
     def build_forward(self):
         forwards = [comp.build_forward() for comp in self.components]

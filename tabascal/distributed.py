@@ -213,29 +213,66 @@ def shard_bl(local_block: np.ndarray, part: BaselinePartition, mesh: Mesh):
     return jax.device_put(np.asarray(local_block), sharding)
 
 
-def _leaf_sharding(x, n_bl: int, mesh: Mesh) -> NamedSharding:
-    """Shard a leaf along baseline axis 0 iff its leading dim is ``n_bl``.
+def is_per_baseline(x, part: "BaselinePartition") -> bool:
+    """Whether leaf ``x`` is a per-baseline quantity to shard along axis 0.
 
-    Per-baseline arrays (``vis_*`` state, ``ast_k_*`` params, ``a1``/``a2``,
-    ``sigma_ast_k``/``mu_ast_k``) lead with ``n_bl`` (the padded baseline count) and
-    are sharded; everything else -- per-antenna params/constants, GP kernels, scalars
-    -- has a different (or no) leading dim and is replicated. ``n_bl`` is the padded
-    count, which for an interferometer (``~n_ant*(n_ant-1)/2``) never coincides with
+    A leaf is per-baseline iff its leading dim equals ``part.local_rows`` -- the number
+    of (padded) baseline rows this process built: the full padded count in
+    single-process, one block in multi-process. Per-antenna params/constants, GP
+    kernels and scalars have a different (or no) leading dim and are replicated.
+    ``local_rows`` for an interferometer (``~n_ant*(n_ant-1)/2``) never coincides with
     ``n_ant`` or ``n_rfi``, so the shape rule is unambiguous.
     """
     ndim = getattr(x, "ndim", 0)
-    spec = _bl_spec(ndim) if (ndim >= 1 and x.shape[0] == n_bl) else P()
-    return NamedSharding(mesh, spec)
+    return ndim >= 1 and x.shape[0] == part.local_rows
 
 
-def put_leaf(x, n_bl: int, mesh: Mesh):
-    """Place one leaf on the mesh, sharded-or-replicated per :func:`_leaf_sharding`."""
-    return jax.device_put(x, _leaf_sharding(x, n_bl, mesh))
+def put_leaf(x, part: "BaselinePartition", mesh: Mesh):
+    """Place one leaf on the mesh: baseline-sharded (assembled from this process's
+    block via :func:`shard_bl`) if per-baseline, else replicated."""
+    if is_per_baseline(x, part):
+        return shard_bl(np.asarray(x), part, mesh)
+    return replicate(np.asarray(x) if hasattr(x, "ndim") else x, mesh)
 
 
-def shard_pytree(tree, n_bl: int, mesh: Mesh):
+def shard_pytree(tree, part: "BaselinePartition", mesh: Mesh):
     """Apply :func:`put_leaf` to every array leaf of ``tree``."""
-    return jax.tree_util.tree_map(lambda x: put_leaf(x, n_bl, mesh), tree)
+    return jax.tree_util.tree_map(lambda x: put_leaf(x, part, mesh), tree)
+
+
+# ---------------------------------------------------------------------------
+# Global reductions over the baseline axis
+# ---------------------------------------------------------------------------
+
+def local_baselines(arr, part: "BaselinePartition"):
+    """Map a *full* per-baseline array (axis 0) onto this process's padded block.
+
+    Used for per-baseline quantities that are read whole rather than via
+    :func:`tabascal.tab_tools.read_ms` -- chiefly the tab-sim truth used to seed
+    ``init: truth`` parameters. Slices to this process's real baselines and pads up to
+    ``local_rows`` so the result lines up with the (padded) per-baseline parameters.
+    ``part is None`` (single device, no sharding) returns the array unchanged.
+    """
+    if part is None:
+        return arr
+    block = np.asarray(arr)[part.start : part.valid_stop]
+    return jnp.asarray(pad_bl(block, part))
+
+
+def all_max(x) -> float:
+    """Global maximum of a process-local scalar across all processes.
+
+    Used for data-derived quantities that fix array *shapes* or priors (e.g.
+    ``max|vis_obs|`` -> RFI GP variance and the integration-sample count): every
+    process must agree on them, or the per-process models would have mismatched
+    shapes and the collectives in the solve would deadlock. No-op single-process.
+    """
+    x = float(x)
+    if jax.process_count() == 1:
+        return x
+    from jax.experimental import multihost_utils
+
+    return float(np.max(np.asarray(multihost_utils.process_allgather(jnp.asarray(x)))))
 
 
 def gather_bl(arr) -> np.ndarray:

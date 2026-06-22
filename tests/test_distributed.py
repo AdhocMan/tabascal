@@ -11,13 +11,26 @@ a subprocess with that flag (mirroring the subprocess pattern in
 Run directly (``python tests/test_distributed.py <case>``) to debug a single case.
 """
 
+import glob
 import os
+import socket
 import subprocess
 import sys
 
 import pytest
 
 CASES = ["primitives", "ffi_op", "map_step", "model_shard"]
+
+# A real tab-sim Measurement Set for the read/assembly tests (no TLEs needed to read
+# visibilities). Skipped if the example data is not present.
+_MS_GLOB = os.path.join(
+    os.path.dirname(__file__), os.pardir, "examples", "data", "*", "*.ms"
+)
+
+
+def _example_ms():
+    hits = sorted(glob.glob(_MS_GLOB))
+    return hits[0] if hits else None
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -168,6 +181,84 @@ def case_map_step():
     _check(np.allclose(np.asarray(g[2]), np.asarray(g_ref[2]), atol=1e-4), "grad phase (replicated)")
 
 
+def test_read_ms_bl_block_equivalence():
+    """read_ms(bl_block) over disjoint blocks reassembles the full single-shot read.
+
+    This is the concrete memory-scaling enabler: each process reads only its baselines.
+    Runs in-process (single device), so no subprocess needed.
+    """
+    import numpy as np
+    from tabascal.tab_tools import read_ms
+
+    ms = _example_ms()
+    if ms is None:
+        pytest.skip("no example MS available")
+
+    full = read_ms(ms)
+    n_bl = full["n_bl"]
+    bnds = [0, n_bl // 3, 2 * (n_bl // 3), n_bl]
+    for key, axis in [("vis_obs", 0), ("flags", 0), ("uvw", 1), ("a1", 0), ("a2", 0)]:
+        parts = []
+        for i in range(3):
+            b = read_ms(ms, bl_block=(bnds[i], bnds[i + 1]))
+            assert b["n_bl"] == n_bl, "n_bl must stay the total count"
+            assert float(b["noise"]) == float(full["noise"]), "noise must be global"
+            parts.append(np.asarray(b[key]))
+        cat = np.concatenate(parts, axis=axis)
+        assert np.array_equal(cat, np.asarray(full[key])), f"{key} block mismatch"
+
+
+def test_multiprocess_read_assembly():
+    """Two real processes (jax.distributed on CPU) each read their baseline block and
+    assemble the global vis_obs via make_array_from_process_local_data; it must equal
+    the single-shot full read. Exercises the multi-process Phase B backbone end-to-end.
+    """
+    ms = _example_ms()
+    if ms is None:
+        pytest.skip("no example MS available")
+
+    with socket.socket() as s:
+        s.bind(("localhost", 0))
+        port = s.getsockname()[1]
+
+    env = dict(os.environ)
+    env["JAX_PLATFORMS"] = "cpu"  # one CPU device per process -> 2 global devices
+    env.pop("XLA_FLAGS", None)  # do NOT force multiple devices per process
+    procs = [
+        subprocess.Popen(
+            [sys.executable, __file__, "mp", str(i), str(port), ms],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for i in range(2)
+    ]
+    outs = [p.communicate(timeout=300) for p in procs]
+    for i, (p, (out, err)) in enumerate(zip(procs, outs)):
+        assert p.returncode == 0, f"process {i} failed:\n{out}\n{err}"
+
+
+def case_mp(process_id, port, ms_path):
+    import jax
+    jax.distributed.initialize(
+        coordinator_address=f"localhost:{port}",
+        num_processes=2,
+        process_id=int(process_id),
+    )
+    import numpy as np
+    import tabascal.distributed as d
+    from tabascal.tab_tools import read_ms, probe_n_bl
+
+    _check(d.sharding_enabled() and jax.process_count() == 2, "expected 2 processes")
+    n_bl = probe_n_bl(ms_path)
+    part = d.bl_partition(n_bl)
+    local = read_ms(ms_path, bl_block=(part.start, part.valid_stop))
+    mesh = d.make_bl_mesh()
+    g = d.shard_bl(d.pad_bl(np.asarray(local["vis_obs"]), part), part, mesh)
+    full = d.gather_bl(g)[:n_bl]
+    if d.is_process_0():
+        ref = np.asarray(read_ms(ms_path)["vis_obs"])
+        _check(np.array_equal(full, ref), "multiprocess assembly != full read")
+
+
 def case_model_shard():
     """``shard_pytree`` shards per-baseline leaves and replicates the rest.
 
@@ -195,7 +286,8 @@ def case_model_shard():
         "L_rfi_A": np.zeros((6, 6), np.float32),
         "noise": np.float32(0.5),
     }
-    out = d.shard_pytree(tree, n_bl, mesh)
+    part = d.bl_partition(n_bl)  # 2 devices: block 5, padded 10, local_rows 10
+    out = d.shard_pytree(tree, part, mesh)
 
     sharded = {"ast_k_r_base", "vis_obs", "a1", "sigma_ast_k"}
     for k, v in out.items():
@@ -207,10 +299,13 @@ def case_model_shard():
 
 
 if __name__ == "__main__":
-    {
-        "primitives": case_primitives,
-        "ffi_op": case_ffi_op,
-        "map_step": case_map_step,
-        "model_shard": case_model_shard,
-    }[sys.argv[1]]()
+    if sys.argv[1] == "mp":
+        case_mp(sys.argv[2], sys.argv[3], sys.argv[4])
+    else:
+        {
+            "primitives": case_primitives,
+            "ffi_op": case_ffi_op,
+            "map_step": case_map_step,
+            "model_shard": case_model_shard,
+        }[sys.argv[1]]()
     print(f"{sys.argv[1]} OK")

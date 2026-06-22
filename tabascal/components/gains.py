@@ -139,7 +139,8 @@ class BaseGPGains(Component):
         self.r_seed = gains_config["r_seed"]
         # Basic shape parameters
         self.n_ant = tab_config.n_ant
-        self.n_bl = tab_config.n_bl
+        self.n_bl = tab_config.n_bl  # GLOBAL (padded) baseline count for traced shapes
+        self.n_bl_local = getattr(tab_config, "n_bl_local", tab_config.n_bl)
         self.n_freq = tab_config.n_freq
         self.n_freq_fine = tab_config.n_freq_fine
         self.n_int_freq = tab_config.n_int_freq
@@ -177,7 +178,7 @@ class BaseGPGains(Component):
 
         self.state_outputs = {
             "gains": jnp.ones((self.n_ant, self.n_freq, self.n_time), dtype=complex),
-            "vis_obs": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_obs": jnp.zeros((self.n_bl_local, self.n_freq, self.n_time), dtype=complex),
         }
 
     def _compute_gp_params(self):

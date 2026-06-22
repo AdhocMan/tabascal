@@ -151,7 +151,7 @@ class FourierTimeAst(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((getattr(self, "n_bl_local", self.n_bl), self.n_freq, self.n_time), dtype=complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -340,7 +340,7 @@ class FourierTimeConstFreqAst(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((getattr(self, "n_bl_local", self.n_bl), self.n_freq, self.n_time), dtype=complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -564,7 +564,7 @@ class FourierTimeFreqAst(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((getattr(self, "n_bl_local", self.n_bl), self.n_freq, self.n_time), dtype=complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -640,7 +640,14 @@ class FourierTimeFreqGPAst(Component):
         try:
             # Store only what's needed for forward computation
             self.n_time = config.n_time
+            # n_bl is the GLOBAL (padded) baseline count -- used for the traced sample
+            # site shapes in build_set_params. n_bl_local is the number of baselines
+            # this process actually builds (a block under the distributed solve, all of
+            # them otherwise); per-baseline *values* constructed in setup use it. part
+            # locates this process's block for slicing whole-array truth.
             self.n_bl = config.n_bl
+            self.n_bl_local = getattr(config, "n_bl_local", config.n_bl)
+            self.part = getattr(config, "part", None)
             self.n_freq = config.n_freq
             self.int_time = config.int_time
             self.chan_width = config.chan_width
@@ -797,6 +804,10 @@ class FourierTimeFreqGPAst(Component):
     def _compute_true_params(self, zarr_path, data_col):
 
         true_vis_ast = read_true_vis_ast(zarr_path, data_col)
+        # Restrict the whole-array truth to this process's baseline block (+padding) so
+        # the truth-seeded init parameters match the sharded per-baseline layout.
+        from tabascal import distributed as dist
+        true_vis_ast = dist.local_baselines(true_vis_ast, self.part)
 
         self.true_ast_k = self.signal_to_latent(true_vis_ast)
         
@@ -812,7 +823,7 @@ class FourierTimeFreqGPAst(Component):
         elif prior_type in ["zeros", 0]:
             print("Using zeros for AST prior mean")
             self.mu_ast_k = jnp.zeros(
-                (self.n_bl, self.n_k_freq_ast, self.n_k_time_ast), dtype=complex
+                (self.n_bl_local, self.n_k_freq_ast, self.n_k_time_ast), dtype=complex
             )
         else:
             raise ValueError(f"Provided prior type: {prior_type} is not valid. Choose from (data, zeros).")
@@ -820,7 +831,7 @@ class FourierTimeFreqGPAst(Component):
     def _set_outputs(self):
 
         self.state_outputs = {
-            "vis_ast": jnp.zeros((self.n_bl, self.n_freq, self.n_time), dtype=complex),
+            "vis_ast": jnp.zeros((getattr(self, "n_bl_local", self.n_bl), self.n_freq, self.n_time), dtype=complex),
         }
 
     def forward_transform(self, base_params, sigma, mu):
@@ -856,7 +867,7 @@ class FourierTimeFreqGPAst(Component):
             print("Using prior sample for AST init")
             prior_sample = random.normal(
                 random.PRNGKey(1),
-                (self.n_bl, self.n_k_freq_ast, self.n_k_time_ast),
+                (self.n_bl_local, self.n_k_freq_ast, self.n_k_time_ast),
                 dtype=complex,
             )
             self.init_ast_k = self.forward_transform(
@@ -881,7 +892,7 @@ class FourierTimeFreqGPAst(Component):
     def _validate_dimensions(self):
         """Ensure all setup operations completed successfully"""
 
-        ast_shape = (self.n_bl, self.n_k_freq_ast, self.n_k_time_ast)
+        ast_shape = (self.n_bl_local, self.n_k_freq_ast, self.n_k_time_ast)
 
         assert_attr_shape(self, "mu_ast_k", ast_shape)
         assert_attr_shape(self, "sigma_ast_k", ast_shape)

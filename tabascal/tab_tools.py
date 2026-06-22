@@ -81,13 +81,17 @@ def reduced_chi2(pred: Array, true: Array, noise: Array, flags: Array):
         jnp.complex128,
     ]
     dtype = [true.dtype == c_type for c_type in complex_types]
-    is_complex = reduce(jnp.logical_or, dtype)
-    if is_complex:
-        norm = 2 * true[~flags].size
-    else:
-        norm = true[~flags].size
+    is_complex = bool(reduce(jnp.logical_or, dtype))
 
-    rchi2 = jnp.sum((jnp.abs(pred[~flags] - true[~flags]) / noise) ** 2) / norm
+    # Mask with where()+sum rather than boolean indexing: the latter produces a
+    # dynamic-shape array that cannot be done eagerly on a baseline-sharded array under
+    # the multi-process solve. This stays on-device (the sums become all-reduces) and is
+    # numerically identical to summing over the unflagged entries.
+    keep = ~flags
+    norm = (2 if is_complex else 1) * jnp.sum(keep)
+    sq = (jnp.abs(pred - true) / noise) ** 2
+
+    rchi2 = jnp.sum(jnp.where(keep, sq, 0.0)) / norm
 
     return rchi2
 
@@ -199,17 +203,24 @@ def print_truth_metrics(pred: dict, truth: dict, tab_config, point: str):
     ``/noise`` and ``/signal`` columns are dimensionless ratios. Noise normalisation is
     omitted for gains. ``point`` is e.g. ``"init"`` or ``"opt"``.
     """
+    from tabascal import distributed as dist
+
     noise = tab_config.noise
-    flags = tab_config.flags
+    # Gather any baseline-sharded arrays to full host arrays so the host-side metric
+    # math (boldean masking, the numpy n_eff) works under the multi-process solve. The
+    # gathers are collectives run identically on every process; printing is silenced on
+    # workers. No-op single-process (to_host == np.asarray).
+    flags = dist.to_host(tab_config.flags)
 
     printed_header = False
     for label, key, use_flags, use_noise, unit in _TRUTH_METRIC_SPECS:
         true = truth.get(key)
         if true is None or bool(jnp.all(jnp.isnan(true))):
             continue
+        true = np.asarray(true)
 
         # pred arrays carry a leading sample axis (batch_ndims=1 from Predictive).
-        p = pred[key]
+        p = dist.to_host(pred[key])
         p = p[0] if p.ndim == true.ndim + 1 else p
 
         diff_full = p - true
@@ -284,6 +295,17 @@ def fix_padding(config: dict, n_freq):
     return config
 
 
+def probe_n_bl(ms_path, data_col: str = "DATA") -> int:
+    """Total baseline count, from MS metadata only (no data-column read).
+
+    Lets the distributed solve compute its baseline partition before deciding which
+    block of baselines each process should read.
+    """
+    xds = xds_from_ms(ms_path)[0]
+    n_time = len(np.unique(xds.TIME.data.compute()))
+    return xds[data_col].data.shape[0] // n_time
+
+
 @measure_runtime
 def read_ms(
     ms_path,
@@ -291,10 +313,29 @@ def read_ms(
     chans: Optional[jax.Array] = None,
     corr: str = "xx",
     data_col: str = "DATA",
+    bl_block: Optional[tuple] = None,
 ):
+    """Read a Measurement Set into JAX arrays.
+
+    ``bl_block=(start, stop)`` reads only that contiguous range of baselines (the
+    per-baseline arrays ``vis_obs``/``flags``/``uvw``/``a1``/``a2`` come back with
+    ``stop - start`` baselines), used by the distributed solve so each process holds
+    only its baseline shard. The returned ``n_bl`` is always the *total* baseline
+    count (needed to size the global solve), and ``noise`` is the global mean over all
+    rows regardless of the block, so every process agrees on it.
+    """
 
     correlations = {"xx": 0, "xy": 1, "yx": 2, "yy": 3}
     corr_idx = correlations[corr]
+
+    def bl_slice(arr, bl_axis):
+        """Slice the baseline axis of a (reshaped) dask array to ``bl_block``."""
+        if bl_block is None:
+            return arr
+        b0, b1 = bl_block
+        idx = [slice(None)] * arr.ndim
+        idx[bl_axis] = slice(b0, b1)
+        return arr[tuple(idx)]
 
     xds = xds_from_ms(ms_path)[0]
     xds_ant = xds_from_table(ms_path + "::ANTENNA")[0]
@@ -337,10 +378,12 @@ def read_ms(
 
     read_data = lambda col_name: jnp.transpose(
         jnp.array(
-            xds[col_name]
-            # .data[:, chans, corr_idx].reshape(n_time, n_bl, n_freq)
-            .data[:, :, corr_idx].reshape(n_time, n_bl, n_freq)
-            .compute()
+            bl_slice(
+                xds[col_name]
+                # .data[:, chans, corr_idx].reshape(n_time, n_bl, n_freq)
+                .data[:, :, corr_idx].reshape(n_time, n_bl, n_freq),
+                bl_axis=1,
+            ).compute()
         ),
         (1, 2, 0),
     )
@@ -364,14 +407,14 @@ def read_ms(
         "freqs": freqs[chans],
         "chan_width": chan_width,
         "ants_itrf": ants_itrf,
-        "uvw": jnp.array(xds.UVW.data.reshape(n_time, n_bl, 3).compute()),
+        "uvw": jnp.array(bl_slice(xds.UVW.data.reshape(n_time, n_bl, 3), bl_axis=1).compute()),
         "vis_obs": read_data(data_col),
         "flags": read_data("FLAG"),
+        # Global noise: mean SIGMA over ALL rows (cheap, one value/row), so every
+        # process agrees regardless of its baseline block.
         "noise": jnp.array(xds.SIGMA.data.mean().compute()),
-        "a1": jnp.array(xds.ANTENNA1.data.reshape(n_time, n_bl)[0, :].compute()),
-        "a2": jnp.array(xds.ANTENNA2.data.reshape(n_time, n_bl)[0, :].compute()),
-        "a1": jnp.array(xds.ANTENNA1.data[:n_bl].compute()),
-        "a2": jnp.array(xds.ANTENNA2.data[:n_bl].compute()),
+        "a1": jnp.array(bl_slice(xds.ANTENNA1.data[:n_bl], bl_axis=0).compute()),
+        "a2": jnp.array(bl_slice(xds.ANTENNA2.data[:n_bl], bl_axis=0).compute()),
     }
 
     return data
