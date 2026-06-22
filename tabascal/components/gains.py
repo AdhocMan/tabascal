@@ -257,6 +257,11 @@ class GPGains(BaseGPGains):
 
     def build_constants(self):
         return {
+            # a1/a2 routed through constants (not captured in the forward closure) so
+            # they arrive as baseline-sharded traced inputs under the distributed solve;
+            # gains[a1] then gathers per-baseline and the product stays baseline-sharded.
+            "a1": self.a1,
+            "a2": self.a2,
             "resample_amp": self.resample_amp,
             "L_gains_amp": self.L_gains_amp,
             "mu_gains_amp": self.mu_gains_amp,
@@ -271,14 +276,15 @@ class GPGains(BaseGPGains):
         forward_transform = self.forward_transform
         gp_amp_mean = self.gp_amp_mean
         gp_phase_mean = self.gp_phase_mean
-        a1 = self.a1
-        a2 = self.a2
         n_freq = self.n_freq
         n_time = self.n_time
 
         def forward(params, state, constants):
 
             interp = lambda R, x, mu: jnp.einsum("ij,afj->afi", R, x - mu) + mu
+
+            a1 = constants[f"{prefix}/a1"]
+            a2 = constants[f"{prefix}/a2"]
 
             gains_amp_induce_base = params["gains_amp_induce_base"]
             gains_phase_induce_base = params["gains_phase_induce_base"]

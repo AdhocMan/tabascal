@@ -19,7 +19,7 @@ import sys
 
 import pytest
 
-CASES = ["primitives", "ffi_op", "map_step", "model_shard"]
+CASES = ["primitives", "ffi_op", "map_step", "model_shard", "gains"]
 
 # A real tab-sim Measurement Set for the read/assembly tests (no TLEs needed to read
 # visibilities). Skipped if the example data is not present.
@@ -298,6 +298,48 @@ def case_model_shard():
             _check(len(spec) == 0, f"{k} should be replicated, got {spec}")
 
 
+def case_gains():
+    """apply_gains shards correctly with a1/a2 routed as sharded constants.
+
+    gains is replicated per-antenna; gains[a1] (gather by a baseline-sharded index)
+    must yield a baseline-sharded result matching the sharded vis. Forward and the
+    gradient on the replicated gains (all-reduced across shards) match single-device.
+    """
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    import tabascal.distributed as d
+    from tabascal.interferometry import apply_gains
+
+    n_ant = 8
+    pairs = [(i, j) for i in range(n_ant) for j in range(i + 1, n_ant)]
+    n_bl, nf, nt = len(pairs), 2, 4
+    rng = np.random.default_rng(3)
+    cf = lambda *s: jnp.asarray(
+        rng.standard_normal(s) + 1j * rng.standard_normal(s), jnp.complex64
+    )
+    a1 = jnp.asarray([p[0] for p in pairs], jnp.int32)
+    a2 = jnp.asarray([p[1] for p in pairs], jnp.int32)
+    gains, vis = cf(n_ant, nf, nt), cf(n_bl, nf, nt)
+
+    ref = apply_gains(gains, vis, a1, a2)
+
+    mesh = d.make_bl_mesh()
+    bl, rep = NamedSharding(mesh, P(d.BL_AXIS)), NamedSharding(mesh, P())
+    gns = jax.device_put(gains, rep)
+    viss, a1s, a2s = (jax.device_put(x, bl) for x in (vis, a1, a2))
+
+    out = jax.jit(apply_gains)(gns, viss, a1s, a2s)
+    _check(tuple(out.sharding.spec)[0] == d.BL_AXIS, f"gains out spec {out.sharding.spec}")
+    _check(np.allclose(np.asarray(out), np.asarray(ref), atol=1e-5), "gains forward")
+
+    gloss = lambda g, v, x, y: jnp.sum(jnp.abs(apply_gains(g, v, x, y)) ** 2)
+    g_ref = jax.grad(lambda g: gloss(g, vis, a1, a2).real)(gains)
+    g_shd = jax.jit(jax.grad(lambda g: gloss(g, viss, a1s, a2s).real))(gns)
+    _check(np.allclose(np.asarray(g_ref), np.asarray(g_shd), atol=1e-4), "grad gains (replicated)")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "mp":
         case_mp(sys.argv[2], sys.argv[3], sys.argv[4])
@@ -307,5 +349,6 @@ if __name__ == "__main__":
             "ffi_op": case_ffi_op,
             "map_step": case_map_step,
             "model_shard": case_model_shard,
+            "gains": case_gains,
         }[sys.argv[1]]()
     print(f"{sys.argv[1]} OK")
