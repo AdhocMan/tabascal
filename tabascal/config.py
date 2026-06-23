@@ -344,8 +344,13 @@ class Model:
     ):
 
         self.noise = tab_config.noise
-        self.likelihood = lambda pred, obs_data: likelihood(
-            pred, obs_data, {"noise": tab_config.noise, "flags": tab_config.flags}
+        # Take `flags` as an explicit argument rather than closing over it. Under a
+        # multi-process solve the flags array is baseline-sharded across
+        # non-addressable devices, and JAX forbids closing over such arrays inside a
+        # jitted step ("Closing over jax.Array that spans non-addressable devices...").
+        # It is threaded through `constants` instead (see build_prob_model).
+        self.likelihood = lambda pred, obs_data, flags: likelihood(
+            pred, obs_data, {"noise": tab_config.noise, "flags": flags}
         )
 
         components = [C() for C in import_components(component_list)]
@@ -363,6 +368,12 @@ class Model:
         for comp in components:
             for key, value in comp.build_constants().items():
                 self.constants[f"{comp.prefix}/{key}"] = value
+
+        # Flags travel with `constants` so the likelihood receives them as an explicit
+        # (baseline-sharded) traced argument instead of a closure capture. Added before
+        # _shard_for_distributed so it gets sharded along the baseline axis like the
+        # other per-baseline constants.
+        self.constants["flags"] = tab_config.flags
 
         self.state["vis_ast"] = jnp.zeros_like(self.state["vis_obs"])
         self.state["vis_rfi"] = jnp.zeros_like(self.state["vis_obs"])
@@ -384,9 +395,10 @@ class Model:
         baseline axis; per-antenna params, GP kernels and scalars are replicated --
         decided purely by leading-dim == ``n_bl`` in :func:`distributed.put_leaf`. The
         observed visibilities and flags on ``tab_config`` are sharded too: ``vis_obs``
-        is the optimizer's ``obs_data`` and ``flags`` is read lazily by the likelihood
-        closure, so both must match the prediction's baseline sharding. No-op on one
-        device (``mesh is None``).
+        is the optimizer's ``obs_data`` (and ``flags`` rides in ``constants``, passed as
+        an explicit argument to the likelihood), so both must match the prediction's
+        baseline sharding. ``tab_config.flags`` is also sharded here for the host-side
+        metrics. No-op on one device (``mesh is None``).
         """
         mesh = getattr(tab_config, "mesh", None)
         if mesh is None:
@@ -447,7 +459,7 @@ class Model:
             numpyro.deterministic("vis_obs", state["vis_obs"])
 
             if obs_data is not None:
-                likelihood(state["vis_obs"], obs_data)
+                likelihood(state["vis_obs"], obs_data, constants["flags"])
 
             return state
 

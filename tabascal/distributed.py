@@ -392,12 +392,17 @@ def gather_bl(arr) -> np.ndarray:
 def to_host(arr) -> np.ndarray:
     """Materialize a (possibly sharded) device array as a full host numpy array.
 
-    Multi-process: gather every process's shard via ``process_allgather``.
+    Multi-process: baseline-sharded arrays are *not* fully addressable on any one
+    process, so they need a cross-process gather (:func:`gather_bl`). Replicated
+    arrays (per-antenna quantities such as ``gains``) are already whole on every
+    process -- gathering them with ``process_allgather(tiled=True)`` would wrongly
+    concatenate the identical per-process copies along axis 0 (e.g. doubling the
+    ``sample`` dimension to ``n_process``), so we just take the local copy.
     Single-process (one controller, any number of local devices): ``np.asarray``
     already assembles the local shards. Used when writing results / computing
     host-side metrics, so callers see the whole array regardless of sharding.
     """
-    if jax.process_count() > 1:
+    if jax.process_count() > 1 and not getattr(arr, "is_fully_addressable", True):
         return gather_bl(arr)
     return np.asarray(arr)
 
