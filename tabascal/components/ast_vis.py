@@ -757,7 +757,14 @@ class FourierTimeFreqGPAst(Component):
         )
 
         self.k0_time = self.ast_fr
-        self.k0s = [self.k0_freq, self.k0_time.max()]
+        # k0_time.max() sets the AST GP mode count (n_k_time_ast via the power-spectrum
+        # cutoff) and thus every per-baseline array shape, so it must be identical on
+        # every process. Each process holds a different baseline block, so the local max
+        # disagrees across ranks (e.g. n_k_time_ast 15 vs 17); the ranks would then trace
+        # different programs and the AST-prior all-reduce in the optimizer step would
+        # deadlock. Reduce globally, exactly as config does for max_rfi_vis.
+        from tabascal import distributed as dist
+        self.k0s = [self.k0_freq, dist.all_max(self.k0_time.max())]
 
         ns = [self.n_freq, self.n_time]
         dxs = [self.chan_width, self.int_time]

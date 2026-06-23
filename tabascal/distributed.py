@@ -342,6 +342,42 @@ def all_max(x) -> float:
     return float(np.max(np.asarray(multihost_utils.process_allgather(jnp.asarray(x)))))
 
 
+def assert_consistent_shapes(tree, name: str = "model arrays") -> None:
+    """Fail fast if any array leaf's shape disagrees across processes.
+
+    A per-process shape divergence -- typically a data-derived size (a GP mode count, an
+    integration-sample count) computed from *this rank's* baseline block instead of
+    reduced globally with :func:`all_max` -- makes the ranks trace structurally
+    different programs, so the first collective in the solve deadlocks with no error.
+    This turns that silent hang into an immediate, located failure: it all-gathers every
+    leaf's shape and checks the ranks agree, naming the offending leaf and the shapes
+    each rank built. The leaves' tree order is identical on every process (same model),
+    so the per-leaf collectives line up. No-op single-process.
+    """
+    if jax.process_count() == 1:
+        return
+    from jax.experimental import multihost_utils
+
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        shape = getattr(leaf, "shape", None)
+        if shape is None:
+            continue
+        # Same leaf -> same ndim on every rank (same model); only dim *values* can drift.
+        # Gather the shape vector and require every rank's to match rank 0's.
+        gathered = np.asarray(
+            multihost_utils.process_allgather(jnp.asarray(shape, dtype=jnp.int32))
+        )
+        if not (gathered == gathered[0]).all():
+            key = jax.tree_util.keystr(path)
+            per_rank = [tuple(int(d) for d in row) for row in gathered]
+            raise RuntimeError(
+                f"Distributed shape mismatch in {name} at '{key}': ranks built "
+                f"{per_rank}. A per-baseline-derived size is being computed from each "
+                f"process's local block instead of reduced across processes (cf. "
+                f"all_max); the solve would deadlock. Reduce it globally at setup."
+            )
+
+
 def gather_bl(arr) -> np.ndarray:
     """Gather a baseline-sharded array to a full host array on every process.
 

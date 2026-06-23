@@ -183,7 +183,7 @@ def _print_model_summary(tab_config, model, start_time):
 
 @measure_runtime
 def tabascal_subtraction(config, sim_dir, ms_path=None, suffix="", extra_tle_dir=None, log=True):
-    from tabascal.distributed import is_process_0, suppress_worker_stdout
+    from tabascal.distributed import is_process_0, suppress_worker_stdout, assert_consistent_shapes
 
     paths = _resolve_paths(config, sim_dir, ms_path, suffix, extra_tle_dir)
     ms_path = paths.ms_path
@@ -199,6 +199,13 @@ def tabascal_subtraction(config, sim_dir, ms_path=None, suffix="", extra_tle_dir
 
         tab_config, model = build_model(config, ms_path)
         prob_model = model.prob_model
+
+        # Catch any per-process shape divergence (e.g. a data-derived size computed from
+        # a local baseline block rather than reduced globally) here, with a located
+        # error, instead of letting the first collective in the solve deadlock silently.
+        assert_consistent_shapes(
+            {"params": model.init_params, "state": model.state, "constants": model.constants}
+        )
 
         _print_model_summary(tab_config, model, start_time)
 
