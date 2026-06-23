@@ -124,9 +124,13 @@ def run_svi(
     guide_family="AutoDelta",
     init_params=None,
     epsilon=1e-3,
-    key=random.PRNGKey(1),
+    key=None,
     dual_run=True,
 ):
+    # Resolve the default key here (not as a default arg) so importing this
+    # module never creates a JAX array and inits the XLA backend prematurely.
+    if key is None:
+        key = random.PRNGKey(1)
     if guide_family == "AutoDelta":
         guide = autoguide.AutoDelta(model)
     elif guide_family == "AutoDiagonalNormal":
@@ -191,8 +195,10 @@ def svi_predict(
     static_args,
     array_args,
     num_samples=100,
-    key=random.PRNGKey(2),
+    key=None,
 ):
+    if key is None:
+        key = random.PRNGKey(2)
     predictive = Predictive(
         model=model, guide=guide, params=vi_params, num_samples=num_samples
     )
@@ -238,7 +244,7 @@ def inv_post_fvp(f, x, v, max_iter):
 
 @partial(jit, static_argnums=(0, 4, 6))
 def post_samples(
-    f, x, y_obs, noise_sigma, num_samples=10, key=random.PRNGKey(1), max_iter=1_000
+    f, x, y_obs, noise_sigma, num_samples=10, key=None, max_iter=1_000
 ):
     """Sample from a Gaussian approximation of the posterior distribution about the MAP point.
 
@@ -264,6 +270,8 @@ def post_samples(
     JAX tree
         JAX tree of parameter samples.
     """
+    if key is None:
+        key = random.PRNGKey(1)
     # Normalize function output such that Likelihood is N(0,1)
     f_norm = lambda x: f(x) / noise_sigma
     key, *subkeys = random.split(key, num=3)

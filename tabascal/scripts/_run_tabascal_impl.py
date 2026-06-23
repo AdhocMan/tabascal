@@ -290,11 +290,11 @@ def set_precision(config):
 
 
 def run(args):
-    # Bring up the JAX distributed runtime first (no-op outside SLURM / single
-    # process); must precede any JAX array creation or device use.
-    from tabascal.distributed import init_distributed
-    init_distributed()
-
+    # NOTE: init_distributed() is called by the CLI entry point (_run_cmd) *before*
+    # this module is imported -- this module transitively imports sgp4jax, which
+    # initialises the XLA backend at import, and jax.distributed.initialize() must
+    # precede any backend init. Do not call it again here (initialize() is not
+    # idempotent).
     if args.timings:
         enable_timings()
 

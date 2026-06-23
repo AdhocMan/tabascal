@@ -3,6 +3,14 @@
 # ---------------------------------------------------------------------------
 
 def _run_cmd(args):
+    # Bring up the JAX distributed runtime *before* importing the heavy run impl.
+    # That import transitively imports sgp4jax, which initialises the XLA backend
+    # at import time; jax.distributed.initialize() must precede any backend init,
+    # so it cannot wait until inside run(). tabascal.distributed only imports jax
+    # itself (no arrays, no sgp4jax), so importing it here is backend-safe.
+    from tabascal.distributed import init_distributed
+    init_distributed()
+
     # Imported lazily so the lightweight subcommands (and --help) don't pay the
     # JAX import cost. The heavy implementation lives in a separate module.
     from tabascal.scripts._run_tabascal_impl import run

@@ -8,17 +8,28 @@ the only collective is a single all-reduce of the summed log-density that JAX/GS
 inserts automatically; the result is one *exact* MAP solution.
 
 This module is the single home for the distributed plumbing so the rest of the code
-stays legible. Nothing here has any effect when only one device is visible
+stays legible. Nothing here has any effect when only one *global* device is visible
 (``jax.device_count() == 1``): ``sharding_enabled()`` is then ``False`` and callers
 take the original single-device path.
 
+A subtlety worth stating up front: ``jax.device_count()`` reports the number of
+*local* devices until :func:`init_distributed` brings up the distributed runtime, and
+the *global* count (summed across all processes) afterwards. So the "one process per
+GPU" layout -- where each process has its single GPU pinned via
+``CUDA_VISIBLE_DEVICES`` -- reads ``device_count() == 1`` *before* init and
+``device_count() == n_processes`` *after*. Enabling sharding for that layout is purely
+a matter of getting :func:`init_distributed` to call ``jax.distributed.initialize()``;
+once it does, the count goes global and every check below lights up unchanged.
+
 Two execution modes are supported and share all the sharding logic:
 
-* **Multi-process** (the target): launched by ``srun`` with one process per GPU.
-  ``init_distributed()`` calls ``jax.distributed.initialize()`` (SLURM auto-detect).
-  Each process reads and holds only *its* baseline block, then assembles a globally
-  addressable ``jax.Array`` via :func:`shard_bl` -- this is what gives true memory
-  scaling (no process materializes the full ``n_bl`` data).
+* **Multi-process** (the target): one process per GPU, launched by ``srun`` or any
+  launcher that exports a world size (MPI, ``torchrun``). ``init_distributed()`` calls
+  ``jax.distributed.initialize()`` -- SLURM auto-detects the coordinator; other
+  launchers supply explicit coordinates. Each process reads and holds only *its*
+  baseline block, then assembles a globally addressable ``jax.Array`` via
+  :func:`shard_bl` -- this is what gives true memory scaling (no process materializes
+  the full ``n_bl`` data).
 * **Single-process, multiple local devices**: e.g. CPU tests with
   ``--xla_force_host_platform_device_count=2`` or a single node's GPUs. Each process
   holds the full array and :func:`shard_bl` partitions it across local devices. Used
@@ -39,6 +50,7 @@ import numpy as np
 
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+import jax.numpy as jnp
 
 # Mesh axis name for the baseline partition.
 BL_AXIS = "bl"
@@ -48,9 +60,17 @@ BL_AXIS = "bl"
 # Initialization / capability checks
 # ---------------------------------------------------------------------------
 
-def _slurm_ntasks() -> int:
-    """Number of SLURM tasks in this step, or 1 when not under SLURM."""
-    for var in ("SLURM_NTASKS", "SLURM_STEP_NUM_TASKS", "SLURM_NPROCS"):
+def _world_size() -> int:
+    """Number of processes in this launch, across known launchers; 1 if single-process.
+
+    Reads the world-size variable exported by whichever launcher started us -- SLURM,
+    OpenMPI, MPICH/Intel MPI (PMI) or ``torchrun``/torch-elastic. We cannot infer
+    multi-process from ``CUDA_VISIBLE_DEVICES`` alone: it tells us a GPU was pinned, not
+    that peers exist or how to reach the coordinator. Returns 1 when no such variable is
+    set, i.e. a plain ``python`` invocation.
+    """
+    for var in ("SLURM_NTASKS", "SLURM_STEP_NUM_TASKS", "SLURM_NPROCS",
+                "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "WORLD_SIZE"):
         val = os.environ.get(var)
         if val:
             try:
@@ -60,24 +80,59 @@ def _slurm_ntasks() -> int:
     return 1
 
 
+def _process_rank() -> int:
+    """This process's rank, across known launchers; 0 if unset."""
+    for var in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "RANK"):
+        val = os.environ.get(var)
+        if val:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+    return 0
+
+
 def init_distributed() -> None:
     """Bring up the JAX distributed runtime when launched multi-process.
 
-    Calls :func:`jax.distributed.initialize` (which auto-detects the SLURM
-    coordinator, process count and id) **only** when more than one SLURM task is
-    present, or when ``TABASCAL_FORCE_DISTRIBUTED`` is set. Outside SLURM -- a plain
-    ``python`` invocation or a single-process multi-device test -- this is a no-op,
-    so we never block waiting for a coordinator that will not appear.
+    Calls :func:`jax.distributed.initialize` **only** when the launcher reports more
+    than one process (:func:`_world_size`), or when ``TABASCAL_FORCE_DISTRIBUTED`` is
+    set. Outside a multi-process launch -- a plain ``python`` invocation or a
+    single-process multi-device test -- this is a no-op, so we never block waiting for a
+    coordinator that will not appear.
+
+    Under SLURM (or when no MPI-style coordinator address is exported) we let JAX
+    auto-detect the coordinator, process count and id. For other launchers that export
+    ``MASTER_ADDR``/``MASTER_PORT`` (``torchrun`` and friends) we pass explicit
+    coordinates so the "one GPU per process via ``CUDA_VISIBLE_DEVICES``" layout works
+    without SLURM. After this call ``jax.device_count()`` reports the *global* device
+    count, so :func:`sharding_enabled` and everything downstream turn on automatically.
 
     Must be called before any JAX array is created (it initializes the device
     backend), i.e. first thing in :func:`tabascal.scripts._run_tabascal_impl.run`.
     """
-    if os.environ.get("TABASCAL_FORCE_DISTRIBUTED") or _slurm_ntasks() > 1:
+    if not (os.environ.get("TABASCAL_FORCE_DISTRIBUTED") or _world_size() > 1):
+        return
+
+    # SLURM auto-detects; so does JAX when no MPI-style coordinator is exported.
+    if os.environ.get("SLURM_NTASKS") or "MASTER_ADDR" not in os.environ:
         jax.distributed.initialize()
+    else:
+        jax.distributed.initialize(
+            coordinator_address=f"{os.environ['MASTER_ADDR']}:{os.environ.get('MASTER_PORT', '1234')}",
+            num_processes=_world_size(),
+            process_id=_process_rank(),
+        )
 
 
 def sharding_enabled() -> bool:
-    """True when more than one global device is visible, so we should shard."""
+    """True when more than one global device is visible, so we should shard.
+
+    ``jax.device_count()`` is the *global* device count once :func:`init_distributed`
+    has run (it is the *local* count before that). So in the one-GPU-per-process layout
+    this returns ``True`` on every process after init, even though each process owns a
+    single device.
+    """
     return jax.device_count() > 1
 
 
@@ -174,8 +229,20 @@ def _bl_spec(ndim: int) -> P:
 
 
 def replicate(x, mesh: Mesh):
-    """Place ``x`` fully replicated on every device of ``mesh``."""
-    return jax.device_put(x, NamedSharding(mesh, P()))
+    """Place ``x`` fully replicated on every device of ``mesh``.
+
+    We build the replicated array with :func:`jax.make_array_from_callback`
+    rather than ``device_put`` because, for a host-local input under a
+    multi-process replicated sharding, ``device_put`` runs a cross-host
+    consistency assertion (``multihost_utils.assert_equal``) that compares
+    values with ``==``. That check spuriously fails for any array containing
+    ``NaN`` (e.g. the ``rmse_*`` sentinel state), since ``nan != nan``, even
+    when the value is genuinely identical on every process. ``make_array_from_callback``
+    trusts the caller and skips that check; every device gets the full array.
+    """
+    x = np.asarray(x)
+    sharding = NamedSharding(mesh, P())
+    return jax.make_array_from_callback(x.shape, sharding, lambda idx: x[idx])
 
 
 def pad_bl(local: np.ndarray, part: BaselinePartition, pad_value=0) -> np.ndarray:

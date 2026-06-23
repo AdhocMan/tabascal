@@ -428,11 +428,16 @@ def run_svi(
     guide_family="AutoDelta",
     init_params=None,
     epsilon=1e-3,
-    key=random.PRNGKey(1),
+    key=None,
     dual_run=True,
     state=None,
     constants=None,
 ):
+    # Default key resolved here, not as a default arg, so importing this module
+    # never creates a JAX array (which would init the XLA backend before
+    # jax.distributed.initialize() runs under multi-process launches).
+    if key is None:
+        key = random.PRNGKey(1)
     if guide_family == "AutoDelta":
         guide = autoguide.AutoDelta(prob_model)
     elif guide_family == "AutoDiagonalNormal":
@@ -546,10 +551,12 @@ def svi_predict(
     guide: autoguide.AutoGuide,
     vi_params: dict,
     num_samples=100,
-    key=random.PRNGKey(2),
+    key=None,
     state=None,
     constants=None,
 ):
+    if key is None:
+        key = random.PRNGKey(2)
     predictive = Predictive(
         model=prob_model, guide=guide, params=vi_params, num_samples=num_samples
     )
