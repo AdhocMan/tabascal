@@ -286,6 +286,26 @@ def _effective_sample_size(resid: np.ndarray) -> float:
     return float(min(max(neff_time * neff_freq * neff_row, 1.0), N))
 
 
+@jax.jit
+def _truth_reductions(pred, true, flags):
+    """RMSE, ``|mean error|`` and signal RMS over the unflagged samples.
+
+    Masked in place rather than selected with ``x[~flags]``: boolean indexing
+    needs the whole mask on the host, which a process holding only its own
+    baselines of a sharded ``flags`` does not have, and it gathers the kept
+    samples into observation-sized copies besides.
+    """
+    keep = jnp.broadcast_to(~flags, true.shape)
+    count = jnp.sum(keep)
+    diff = jnp.where(keep, pred - true, 0)
+    signal = jnp.where(keep, true, 0)
+    return (
+        jnp.sqrt(jnp.sum(jnp.abs(diff) ** 2) / count),
+        jnp.abs(jnp.sum(diff) / count),
+        jnp.sqrt(jnp.sum(jnp.abs(signal) ** 2) / count),
+    )
+
+
 def print_truth_metrics(pred: dict, truth: dict, tab_config, point: str):
     """Print truth-based error metrics for the available ast/rfi visibilities and gains.
 
@@ -324,14 +344,10 @@ def print_truth_metrics(pred: dict, truth: dict, tab_config, point: str):
 
         diff_full = p - true
         mask = flags if (use_flags and flags is not None and flags.shape == true.shape) else None
-        if mask is not None:
-            diff, masked_true = diff_full[~mask], true[~mask]
-        else:
-            diff, masked_true = diff_full, true
-
-        r = float(jnp.sqrt(jnp.mean(jnp.abs(diff) ** 2)))   # RMSE: bias + scatter
-        me = float(jnp.abs(jnp.mean(diff)))                 # |mean error|: coherent bias
-        signal = float(jnp.sqrt(jnp.mean(jnp.abs(masked_true) ** 2)))
+        # RMSE (bias + scatter), |mean error| (coherent bias) and the signal level.
+        r, me, signal = map(float, _truth_reductions(
+            p, true, mask if mask is not None else jnp.asarray(False)
+        ))
         n_eff = _effective_sample_size(np.asarray(diff_full))
         sigma = np.sqrt(2.0 * n_eff) * me / r if r > 0 else 0.0
 
@@ -680,12 +696,12 @@ def run_custom_svi(
     return SVIRunResult(params_out, jnp.array(losses))
 
 
-@partial(jax.jit, static_argnums=(0, 1))
-def _predict(prob_model, n_rfi, key, params, obs_data, state, constants, vis_obs, noise, flags):
+@partial(jax.jit, static_argnums=(0,))
+def _predict(prob_model, key, params, obs_data, state, constants, vis_obs, noise, flags):
     """One-sample ``Predictive`` at ``params`` and its reduced chi^2, as one executable.
 
-    Placed as the downstream writers expect: per-RFI sites split over the mesh,
-    everything else replicated.
+    Placed as the downstream writers expect: replicated, so process 0 can read
+    every site whole.
     """
     # Sharding invariant: 1 sample -> numpyro calls the model without vmap, so the
     # shard_map-wrapped RFI-vis components (incl. the FFI kernel, which has no
@@ -695,7 +711,7 @@ def _predict(prob_model, n_rfi, key, params, obs_data, state, constants, vis_obs
         posterior_samples=tree_map(lambda x: x[None], params),
         batch_ndims=1,
     )(key, obs_data=obs_data, state=state, constants=constants)
-    return constrain_prediction(pred, n_rfi), reduced_chi2(pred["vis_obs"][0], vis_obs, noise, flags)
+    return constrain_prediction(pred), reduced_chi2(pred["vis_obs"][0], vis_obs, noise, flags)
 
 
 @measure_runtime
@@ -704,7 +720,7 @@ def init_predict(
 ):
 
     init_pred, rchi2 = _predict(
-        prob_model, getattr(tab_config, "n_rfi", 0), subkey, init_params, None, state, constants,
+        prob_model, subkey, init_params, None, state, constants,
         tab_config.vis_obs, tab_config.noise, tab_config.flags,
     )
     print()
@@ -765,7 +781,7 @@ def run_opt(
     # Strip _auto_loc suffix to get raw param names for Predictive
     raw_params = {k.removesuffix("_auto_loc"): v for k, v in vi_params.items()}
     vi_pred, rchi2 = _predict(
-        prob_model, getattr(tab_config, "n_rfi", 0), subkeys[1], raw_params, tab_config.vis_obs,
+        prob_model, subkeys[1], raw_params, tab_config.vis_obs,
         state, constants, tab_config.vis_obs, tab_config.noise, tab_config.flags,
     )
 

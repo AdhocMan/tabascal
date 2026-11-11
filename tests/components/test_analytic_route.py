@@ -58,7 +58,7 @@ def make_config(
         n_int_time=n_int_time, n_int_freq=n_int_freq,
     )
     sig = make_rfi_config(
-        n_rfi=n_rfi, n_rfi_real=n_rfi, n_ant=n_ant, n_freq=n_freq, n_time=n_time,
+        n_rfi=n_rfi, n_ant=n_ant, n_freq=n_freq, n_time=n_time,
         n_int_freq=n_int_freq, n_int_time=n_int_time, corr_time=corr_time, corr_freq=1e9,
         init="sample",
     )
@@ -416,7 +416,7 @@ class TestAnalyticVis:
         cfg, state = op_case()
         cfg.args["data"]["save_rfi_per_sat"] = True
         cfg.args["model"] = {"components": ["rfi_vis:AnalyticVis"]}
-        cfg.n_rfi = cfg.n_rfi_real = 2
+        cfg.n_rfi = 2
         cfg.norad_ids = [101, 102]
         total = analytic_call(cfg, {**state, "vis_rfi": jnp.zeros_like(state["vis_rfi"])})(
             state["rfi_A"], state["rfi_phase"]

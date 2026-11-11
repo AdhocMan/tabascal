@@ -520,14 +520,19 @@ def test_a_baseline_block_size_that_is_not_a_positive_whole_number_is_rejected(
 @pytest.mark.parametrize("Impl", [RiemannVisFine, RiemannVisVariableFine])
 @pytest.mark.parametrize("name, expected", [(None, "ffi"), ("ffi", "ffi"), ("jax", "jax")])
 def test_rfi_backend_picks_the_implementation(Impl, name, expected):
-    """null is the default, ``ffi``; the FFI route is the one that has no constants."""
+    """null is the default, ``ffi``; the FFI route is the one that sorts its indices.
+
+    Both carry each device's baselines as index rows, but only the compiled op
+    takes the sorters and start offsets ``RFIVisOp`` builds from them.
+    """
     config = make_variable_config(4, 2, 3, 5, 4, 3, strides=[1, 2])
     config.args["rfi"]["backend"] = name
     impl = Impl()
     impl.setup(config)
 
     assert impl.backend == expected
-    assert (impl.build_constants() == {}) == (expected == "ffi")
+    sorted_ = any("sorter" in key for key in impl.build_constants())
+    assert sorted_ == (expected == "ffi")
 
 
 @pytest.mark.parametrize("name", ["FFI", "xla", 1])
@@ -557,7 +562,7 @@ _SHARDED_BLOCK_SCRIPT = textwrap.dedent(
     from tabascal.distributed import sharding_enabled
 
     assert jax.device_count() == 2, jax.device_count()
-    assert sharding_enabled(), "the RFI axis is not sharded"
+    assert sharding_enabled(), "the baselines are not sharded"
 
     n_ant, n_rfi, n_freq, n_int_freq, n_time, n_int_time = 12, 8, 3, 2, 4, 2
     a1, a2 = jnp.triu_indices(n_ant, 1)
@@ -618,17 +623,17 @@ _SHARDED_BLOCK_SCRIPT = textwrap.dedent(
 )
 
 
-def test_every_block_size_agrees_with_the_rfi_axis_split_across_devices():
+def test_every_block_size_agrees_with_the_baselines_split_across_devices():
     """The scan lives inside the shard_map body, so the block interacts with it.
 
-    A null block size is the case worth spending a subprocess on: it is the one
-    where the body holds every baseline at once, which is also what the psum
-    that follows has to keep coarse-grid sized. Run under two devices, since
-    sharding is decided by the device count at import, and in the session's own
-    precision, since the sharded path is otherwise only ever seen in double.
+    Each device scans only its own baselines, so a block size larger than a
+    device's share, or null, is the case worth spending a subprocess on. Run
+    under two devices, since sharding is decided by the device count, and in
+    the session's own precision, since the sharded path is otherwise only ever
+    seen in double.
 
-    Value, JVP and VJP, because the checkpoint and the psum each have their own
-    rule and a defect in one need not show in the others.
+    Value, JVP and VJP, because the checkpoint and the shard_map each have their
+    own rule and a defect in one need not show in the others.
     """
     env = {
         **os.environ,

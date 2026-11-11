@@ -2104,7 +2104,7 @@ def stub_orbits(monkeypatch):
             )
             for n in ids
         ]
-        return None, None, ids, records, len(ids)
+        return None, None, ids, records
 
     monkeypatch.setattr(mod, "fetch_orbital_elements", _fetch)
 
@@ -2143,7 +2143,7 @@ def stub_config_mode(monkeypatch, obs, record, tmp_path):
         a1=obs.a1,
         a2=obs.a2,
         norad_ids=[NORAD_ID],
-        n_rfi_real=1,
+        n_rfi=1,
         orbit_records=[record],
         min_elevation=0.0,
         rfi_mask=None,

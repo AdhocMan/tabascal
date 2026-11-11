@@ -1,9 +1,9 @@
 from tabascal.distributed import (
-    constrain_rfi_state,
     fail_together,
     is_process_0,
     make_global,
-    rfi_sharding,
+    replicated_sharding,
+    shard_pytree,
     sharding_enabled,
 )
 from tabascal.gain_table import gains_from_tables, normalise_gain_tables
@@ -1134,7 +1134,7 @@ def wants_rfi_per_sat(vi_pred: dict, tab_config) -> bool:
     return bool(
         tab_config.args["data"].get("save_rfi_per_sat", False)
         and "rfi_A" in vi_pred
-        and int(getattr(tab_config, "n_rfi_real", getattr(tab_config, "n_rfi", 0)))
+        and int(getattr(tab_config, "n_rfi", 0))
     )
 
 
@@ -1144,18 +1144,18 @@ def per_sat_layout(vi_pred: dict, tab_config):
     The store it is streamed into has to exist before the first collective (see
     :func:`rfi_vis_per_sat`), so what the store has to hold is read off the fit
     rather than off the result: the sample axis and the visibility shape from
-    ``vi_pred``, the satellite axis from the run's *real* source count, and the
+    ``vi_pred``, the satellite axis from the run's source count, and the
     ``src`` coordinate from the satellites those name.
     """
 
     vis_rfi = vi_pred["vis_rfi"]
     n_sample = vi_pred["rfi_A"].shape[0]
-    n_real = int(getattr(tab_config, "n_rfi_real", getattr(tab_config, "n_rfi", 0)))
+    n_rfi = int(getattr(tab_config, "n_rfi", 0))
 
     return (
-        (n_sample, n_real) + tuple(vis_rfi.shape[1:]),
+        (n_sample, n_rfi) + tuple(vis_rfi.shape[1:]),
         np.dtype(vis_rfi.dtype),
-        [int(nid) for nid in tab_config.norad_ids[:n_real]],
+        [int(nid) for nid in tab_config.norad_ids[:n_rfi]],
     )
 
 
@@ -1238,12 +1238,10 @@ def _remove_partial_store(file_path: str) -> None:
 def _source_mask(r: int, n_rfi: int):
     """A boolean ``(n_rfi, 1, 1, 1)`` mask selecting source ``r`` alone.
 
-    A **global** array under sharding, built through :func:`make_global` on the
-    RFI sharding, rather than a ``jnp.arange`` comparison: the operands it is
-    combined with are global arrays split over the mesh, and a process-local
-    array of the full length mixed into that is the mistake the distributed
-    layer exists to avoid -- every process would be describing the whole source
-    axis while holding one shard of it.
+    A **global** array under sharding, replicated over the mesh through
+    :func:`make_global`, rather than a ``jnp.arange`` comparison: the operands
+    it is combined with are global arrays, and a process-local array mixed into
+    them is the mistake the distributed layer exists to avoid.
 
     Boolean rather than 0/1, because it is used with ``jnp.where`` (see
     :func:`rfi_vis_per_sat`) and never multiplied.
@@ -1253,7 +1251,7 @@ def _source_mask(r: int, n_rfi: int):
     mask[r] = True
 
     if sharding_enabled():
-        return make_global(mask, rfi_sharding())
+        return make_global(mask, replicated_sharding())
 
     return jnp.asarray(mask)
 
@@ -1292,33 +1290,27 @@ def rfi_vis_per_sat(vi_pred: dict, tab_config, sink=None):
     The caveat is about what can be *promised*, and the promise is qualitative.
 
     Zeroed rather than sliced, at ``n_rfi`` times the cost of a slice, because
-    that is what keeps the RFI-axis sharding intact: the op runs inside
-    ``psum_over_rfi``'s ``shard_map``, whose ``in_specs`` require the full
-    ``n_rfi`` leading axis, and a one-source slice could not be split across the
-    mesh at all. The alternative -- gathering the fine grids to one process --
-    would materialise the largest arrays in the run on a single device, which is
-    precisely what the sharding exists to avoid. Every process must therefore
-    call this: the evaluations are collectives. Only process 0 keeps the result,
-    since the op's output is replicated by the ``psum``.
-
-    Padded sources are excluded: sharding pads the satellite list to a multiple
-    of the device count with dark dummies, and only ``norad_ids[:n_rfi_real]``
-    name a satellite. They contribute exactly zero, so dropping them leaves the
-    sum-back above untouched.
+    the component is the run's own, set up for the whole source axis: its
+    constants -- ``AnalyticVis``'s elevation mask among them -- are indexed by
+    ``n_rfi``, and one compile then serves every source. Under sharding the op
+    runs inside ``map_over_baselines``' ``shard_map``, each device computing its
+    own baselines, so every process must call this: the evaluations are
+    collectives. The result is gathered whole onto every device, and only
+    process 0 keeps it.
 
     ``sink`` is how the result leaves without ever being whole: a callable
     ``sink(sample, source, block)`` handed each evaluated ``(n_bl, n_freq,
     n_time)`` block on process 0 as it is made, in place of storing it. **With a
     sink the peak this adds to the writing process is a small multiple of one
     block** -- the block on the device, its copy on the host, and whatever the
-    sink's write buffers -- rather than the ``n_rfi_real x sizeof(vis_rfi)`` the
+    sink's write buffers -- rather than the ``n_rfi x sizeof(vis_rfi)`` the
     accumulating form holds before the zarr sees any of it, which is the whole of
     the option's memory cost at a real channel count. Without one the array is
     assembled and returned, which is what an interactive caller wants and what
     the tests compare against.
 
     Returns ``(vis_src, norad_ids)`` with ``vis_src`` of shape ``(n_sample,
-    n_rfi_real, n_bl, n_freq, n_time)`` in the model's own dtype -- ``None`` off
+    n_rfi, n_bl, n_freq, n_time)`` in the model's own dtype -- ``None`` off
     process 0, and ``None`` whenever a ``sink`` took the blocks -- and
     ``norad_ids`` the satellite behind each ``src`` index.
     """
@@ -1326,6 +1318,8 @@ def rfi_vis_per_sat(vi_pred: dict, tab_config, sink=None):
     comp = import_components([_rfi_vis_reference(tab_config)])[0]()
     comp.setup(tab_config)
     constants = {f"{comp.prefix}/{k}": v for k, v in comp.build_constants().items()}
+    # Each device's index rows split over the mesh, as in the fit itself.
+    constants = shard_pytree(constants, vi_pred["vis_rfi"].shape[1])
     forward = comp.build_forward()
 
     rfi_A, rfi_phase = vi_pred["rfi_A"], vi_pred["rfi_phase"]
@@ -1339,9 +1333,16 @@ def rfi_vis_per_sat(vi_pred: dict, tab_config, sink=None):
     # One compile, reused for every source and sample: the mask is an argument
     # rather than a Python constant. Jitted so the masking fuses into the
     # reshape the op makes of rfi_A anyway, instead of leaving a second
-    # full-size copy of the fine grid resident beside it.
-    @jax.jit
-    def one_source(mask, rfi_A, rfi_phase, vis_zero, extra):
+    # full-size copy of the fine grid resident beside it. The result comes back
+    # whole, since each device computed only its own baselines of it and
+    # process 0 has to read all of them. The constants are an argument too: they
+    # hold each device's index rows, split across processes, and a compiled
+    # function may not close over such an array.
+    @partial(
+        jax.jit,
+        out_shardings=replicated_sharding() if sharding_enabled() else None,
+    )
+    def one_source(mask, rfi_A, rfi_phase, vis_zero, extra, constants):
         # where, not a multiply by 0/1: a masked source is then exactly zero even
         # where the fitted grid is not finite, since 0 * inf and 0 * nan are nan
         # and one bad source would poison every other source's column -- the same
@@ -1356,7 +1357,7 @@ def rfi_vis_per_sat(vi_pred: dict, tab_config, sink=None):
             **{k: jnp.where(mask, v, 0) for k, v in extra.items()},
         }
 
-        return forward({}, constrain_rfi_state(state, n_rfi), constants)["vis_rfi"]
+        return forward({}, state, constants)["vis_rfi"]
 
     keep = is_process_0()
     vis_src, failure = None, None
@@ -1365,7 +1366,7 @@ def rfi_vis_per_sat(vi_pred: dict, tab_config, sink=None):
         # Allocated before the first evaluation, and a failure here is carried to
         # the end rather than raised on the spot: the evaluations below are
         # collectives, and a rank that leaves the loop early strands every other
-        # rank in the next psum until the coordinator times out. Every rank makes
+        # rank in the next collective until the coordinator times out. Every rank makes
         # every call; only process 0 stores what comes back.
         try:
             vis_src = np.empty(shape, dtype=dtype)
@@ -1377,13 +1378,13 @@ def rfi_vis_per_sat(vi_pred: dict, tab_config, sink=None):
         for r in range(n_real):
             vis = one_source(
                 _source_mask(r, n_rfi), rfi_A[s], rfi_phase[s], vis_zero,
-                {k: v[s] for k, v in extra.items()},
+                {k: v[s] for k, v in extra.items()}, constants,
             )
 
             # The evaluation is unconditional; only what happens to the block is
             # not. A failed store -- a full disk on the sink's first write as
             # much as a failed allocation above -- stops the storing and not the
-            # loop, for the same reason: every rank has to reach every psum.
+            # loop, for the same reason: every rank has to reach every collective.
             if not keep or failure is not None:
                 continue
 
@@ -1727,7 +1728,7 @@ def write_results_xds(
     # is ~n_rfi x the rfi_vis storage and n_rfi forward-op evaluations.
     #
     # Reached by every process because it is a collective: the op runs inside
-    # psum_over_rfi's shard_map. The workers write nothing; they make the
+    # map_over_baselines' shard_map. The workers write nothing; they make the
     # evaluations, skip the writing below, and leave at the same exit.
     #
     # The store is created *here*, before the first of those collectives, and
@@ -1757,7 +1758,7 @@ def write_results_xds(
     if per_sat:
         # Read off the fit's shape, so it is the same on every rank and is taken
         # outside the rank-0 branch below: an error in it is then an error
-        # everywhere, rather than one rank that never arrives at the psum the
+        # everywhere, rather than one rank that never arrives at the collective the
         # others are waiting in.
         layout = per_sat_layout(vi_pred, tab_config)
 
@@ -1833,7 +1834,7 @@ def write_results_xds(
             map_xds.to_zarr(file_path, mode="a" if per_sat else mode)
         except Exception as err:
             # Carried, not raised, like every other failure here: past the
-            # per-satellite psums is not past the run's collectives, and process
+            # per-satellite collectives is not past the run's collectives, and process
             # 0 leaving on its own strands the workers in the next one.
             map_xds, failure = None, err
 

@@ -777,14 +777,15 @@ def test_pipeline_writes_into_its_own_run_directory(
 
 
 # ---------------------------------------------------------------------------
-# RFI-axis device sharding (multi-GPU / multi-process)
+# Baseline-axis device sharding (multi-GPU / multi-process)
 # ---------------------------------------------------------------------------
 #
-# tabascal shards the MAP solve over the RFI-source axis whenever more than one
+# tabascal shards the MAP solve over the baseline axis whenever more than one
 # device is visible (see tabascal/distributed.py). These tests fake extra devices
 # on CPU (XLA_FLAGS) / spawn two coordinated processes (jax.distributed) and
 # require the sharded solve to reproduce the single-device solve. The test sim has
-# 3 satellites, so a 2-device mesh also exercises the dark-dummy padding (3 -> 4).
+# 8 antennas, 28 baselines, which split evenly over 2 devices; the uneven split
+# is covered by tests/test_distributed.py.
 
 def _sharded_components(rfi_vis: str) -> list[str]:
     return [
@@ -880,9 +881,9 @@ def _cpu_env(n_devices: int) -> dict:
 @pytest.mark.parametrize(
     "rfi_backend",
     [
-        # The jax backend runs entirely through GSPMD+shard_map on pure JAX ops;
-        # the ffi backend additionally exercises the custom C kernel inside
-        # shard_map (the reason for check_vma=False in psum_over_rfi).
+        # The jax backend runs pure JAX ops inside shard_map; the ffi backend
+        # additionally exercises the custom C kernel there (the reason for
+        # check_vma=False in map_over_baselines).
         "jax",
         "ffi",
     ],
@@ -890,7 +891,7 @@ def _cpu_env(n_devices: int) -> dict:
 def test_pipeline_sharded_equivalence(
     provide_test_data: Path, tmp_path: Path, precision: str, rfi_backend: str
 ) -> None:
-    """Sharded run (2 fake CPU devices, padding 3 sats -> 4) == single-device run.
+    """Sharded run (2 fake CPU devices, 14 baselines each) == single-device run.
 
     Exact in double precision up to summation reduction order, hence the requires-
     double skip and the tight (but not bitwise) tolerance on the optimized chi^2.
@@ -925,8 +926,7 @@ def test_pipeline_sharded_equivalence(
     )
     assert shard.returncode == 0, f"sharded run failed: {shard.stderr}"
 
-    assert "Padded 3 RFI sources to 4" in shard.stdout
-    assert "Sharding RFI sources over 2 devices:" in shard.stdout
+    assert "Sharding baselines over 2 devices:" in shard.stdout
     assert "Sharding" not in ref.stdout
     assert "Running on single device:" in ref.stdout
 
@@ -942,9 +942,8 @@ def test_pipeline_sharded_equivalence(
 def _assert_per_sat_results(out_dir: Path) -> None:
     """What a ``save_rfi_per_sat`` run must have left in its results zarr.
 
-    Written once, holding only the *real* satellites -- the sharded runs pad 3
-    sources to 4 for the mesh, and the dummy names no satellite -- and still
-    summing back to the ``rfi_vis`` it decomposes.
+    Written once, holding one slice per satellite, and still summing back to
+    the ``rfi_vis`` it decomposes.
     """
 
     import numpy as np
@@ -958,8 +957,7 @@ def _assert_per_sat_results(out_dir: Path) -> None:
         sources = xds.rfi_vis_src.values
         total = xds.rfi_vis.values
 
-    # The per-device partial sums the psum adds up have to cover every satellite.
-    # The 64 ulps are a measured regime and not a bound: splitting the op's one
+    # The per-satellite pieces have to cover every satellite. The 64 ulps are a measured regime and not a bound: splitting the op's one
     # reduction over (source, integration sample) is re-association, and what it
     # costs is set by the fine-grid terms rather than by the coarse magnitudes
     # this is referenced to -- which can differ by everything under fine-grid
@@ -976,12 +974,12 @@ def test_pipeline_sharded_per_sat(
 ) -> None:
     """``data.save_rfi_per_sat`` on a 2-device mesh, in one process.
 
-    The RFI axis really is split here, so the per-satellite evaluation goes
-    through ``psum_over_rfi``'s ``shard_map`` and its source mask has to be a
-    global array on that mesh rather than a process-local one -- everything the
-    decomposition does differently under sharding, short of a second process,
-    which ``test_pipeline_multiprocess_per_sat`` covers. The 3 satellites are
-    padded to 4 for the mesh, so the padded dummy has to stay out of the zarr.
+    The baselines really are split here, so the per-satellite evaluation goes
+    through ``map_over_baselines``' ``shard_map``, its index rows and source
+    mask have to be global arrays on that mesh rather than process-local ones,
+    and its result has to come back whole -- everything the decomposition does
+    differently under sharding, short of a second process, which
+    ``test_pipeline_multiprocess_per_sat`` covers.
     """
     if precision != "double":
         pytest.skip("uses components that require double precision")
@@ -994,8 +992,7 @@ def test_pipeline_sharded_per_sat(
     )
 
     assert run.returncode == 0, f"sharded run failed: {run.stderr}"
-    assert "Padded 3 RFI sources to 4" in run.stdout
-    assert "Sharding RFI sources over 2 devices:" in run.stdout
+    assert "Sharding baselines over 2 devices:" in run.stdout
 
     _assert_per_sat_results(out_dir)
 
@@ -1056,7 +1053,7 @@ def test_pipeline_multiprocess(
     """Two coordinated processes (jax.distributed, 1 CPU device each) solve once.
 
     Verifies the full multi-process path: coordinator bring-up through the
-    MASTER_ADDR/RANK env route in init_distributed, RFI padding/sharding across
+    MASTER_ADDR/RANK env route in init_distributed, baseline sharding across
     processes, worker stdout silence, and rank-0-only result writing.
     """
     if precision != "double":
@@ -1066,7 +1063,7 @@ def test_pipeline_multiprocess(
     outs = _run_two_processes(cmd, tmp_path)
 
     rank0_out = outs[0][0]
-    assert "Sharding RFI sources over 2 devices:" in rank0_out
+    assert "Sharding baselines over 2 devices:" in rank0_out
     _assert_chi2(rank0_out, _SHARDED_CHI2_REF)
 
     # Workers must be silent and must not write results; rank 0 wrote them once.
@@ -1091,13 +1088,11 @@ def test_pipeline_multiprocess_per_sat(
     """``data.save_rfi_per_sat`` across two processes: the sharded decomposition.
 
     Nothing single-process reaches what this covers. The per-satellite
-    evaluation runs inside ``psum_over_rfi``'s ``shard_map``, so it is a
+    evaluation runs inside ``map_over_baselines``' ``shard_map``, so it is a
     collective every rank has to make -- a rank that skipped it, or made a
     different number of them, would hang here rather than in a comment -- and
-    its source mask has to be a *global* array on the RFI sharding, since a
-    process-local one of the full length describes an axis each process holds
-    only a shard of. The 3 satellites are padded to 4 for the 2-device mesh, so
-    this is also where the padded dummy has to stay out of what is written.
+    each evaluation's baselines are computed on two processes, so the result
+    has to be gathered whole before process 0 can write it.
     """
     if precision != "double":
         pytest.skip("uses components that require double precision")
@@ -1106,8 +1101,6 @@ def test_pipeline_multiprocess_per_sat(
         provide_test_data, tmp_path, save_rfi_per_sat=True
     )
     outs = _run_two_processes(cmd, tmp_path)
-
-    assert "Padded 3 RFI sources to 4" in outs[0][0]
 
     # Written once, by rank 0, and holding only the real satellites.
     _assert_per_sat_results(out_dir)

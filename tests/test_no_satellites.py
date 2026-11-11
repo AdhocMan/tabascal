@@ -21,14 +21,13 @@ def _empty_resolution() -> TLEResolution:
 
 
 def test_element_fetch_yields_an_empty_rfi_model():
-    elements, epoch_jd, norad_ids, orbit_records, n_rfi_real = fetch_orbital_elements(
+    elements, epoch_jd, norad_ids, orbit_records = fetch_orbital_elements(
         resolution=_empty_resolution()
     )
     assert elements.shape == (0, 6)
     assert epoch_jd.shape == (0,)
     assert norad_ids == []
     assert orbit_records == []
-    assert n_rfi_real == 0
 
 
 def test_rfi_sampling_estimate_survives_zero_satellites():

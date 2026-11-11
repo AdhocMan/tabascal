@@ -254,7 +254,7 @@ per component — the real and imaginary parts separately, since a `complex64` c
 
 On fitted grids it is round-off: measured at ~2e-16 relative in double precision and ~6e-8 in single. Treat the sum-back as an exact identity that floating point perturbs, rather than as a guarantee with a number on it, and read a large discrepancy as what it usually is — a dropped source or a column in the wrong frame, which are orders of magnitude larger again — before suspecting cancellation.
 
-A satellite is named by its NORAD id, so a run that somehow fitted the same satellite twice is refused rather than writing one column per *pair* of sources. Sources the sharding padded the list with are not written at all: they carry no signal and name no satellite.
+A satellite is named by its NORAD id, so a run that somehow fitted the same satellite twice is refused rather than writing one column per *pair* of sources.
 
 Note that a run narrowed to one channel with `data.freq` is refused here too — the results then cover part of the MS's band, and nothing in them says which part.
 

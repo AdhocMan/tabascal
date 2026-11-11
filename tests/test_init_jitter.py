@@ -142,27 +142,6 @@ def test_the_draw_is_not_the_one_ast_init_sample_takes():
     assert not np.array_equal(draw(7, "ast_k_r_base", x), ast_key_draw)
 
 
-@pytest.mark.parametrize("kind", ["absolute", "relative"])
-@pytest.mark.parametrize("n_real", [2, 3])
-def test_padded_dummy_sources_stay_dark_and_do_not_change_the_real_draw(kind, n_real):
-    """Padding preserves real draws and leaves non-RFI axes fully perturbed."""
-    params = start()
-    rfi = params["rfi_k_r_base"]
-    rfi = jax.numpy.concatenate([rfi, rfi[:1]])[:n_real]
-    params["rfi_k_r_base"] = rfi
-    padded = dict(params, rfi_k_r_base=jax.numpy.concatenate([
-        rfi, jax.numpy.zeros((4 - n_real, *rfi.shape[1:]), dtype=rfi.dtype),
-    ]))
-    spec = {"": 0.1, "rfi_k_r_base": {kind: 0.1}}
-
-    unpadded_out = jitter_init(params, spec, seed=7, n_rfi=n_real, n_rfi_real=n_real)
-    padded_out = jitter_init(padded, spec, seed=7, n_rfi=4, n_rfi_real=n_real)
-
-    np.testing.assert_array_equal(padded_out["rfi_k_r_base"][:n_real], unpadded_out["rfi_k_r_base"])
-    np.testing.assert_array_equal(padded_out["rfi_k_r_base"][n_real:], 0)
-    np.testing.assert_array_equal(padded_out["ast_k_r_base"], unpadded_out["ast_k_r_base"])
-
-
 # ---------------------------------------------------------------------------
 # What is refused
 # ---------------------------------------------------------------------------
@@ -329,7 +308,7 @@ def test_the_run_header_carries_the_jitter(jittered_fits, seed):
 
 
 def test_the_runner_jitters_once_before_sharding_and_shares_the_start(tmp_path, monkeypatch, capsys):
-    """One padded start reaches sharding, prediction and the optimiser in that order."""
+    """One start reaches sharding, prediction and the optimiser in that order."""
     from tabascal.scripts import _run_tabascal_impl as impl
     from tests.test_seeds import run_stubbed
 
@@ -339,12 +318,12 @@ def test_the_runner_jitters_once_before_sharding_and_shares_the_start(tmp_path, 
 
     def jitter(params, spec, seed, **kwargs):
         events.append("jitter")
-        assert kwargs == {"n_rfi": 4, "n_rfi_real": 3}
+        assert kwargs == {}
         out = actual(params, spec, seed, **kwargs)
         starts.append(out)
         return out
 
-    def shard(params, n_rfi):
+    def shard(params, n_bl):
         if any(params.keys() == start.keys() for start in starts):
             events.append("shard_start")
         return params

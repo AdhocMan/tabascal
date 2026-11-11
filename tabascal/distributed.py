@@ -1,6 +1,7 @@
 import os
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable
 
@@ -107,104 +108,129 @@ def process_count() -> int:
     return jax.process_count()
 
 # ---------------------------------------------------------------------------
-# RFI-axis sharding
+# Baseline-axis sharding
 # ---------------------------------------------------------------------------
+#
+# A sharded run splits the visibility axis. Each device owns one contiguous block
+# of baselines, in the order the data already has, computes only those rows and
+# holds only those rows of every visibility-shaped array; nothing visibility-sized
+# is ever summed across devices, only the scalar likelihood is. Per-source and
+# per-antenna arrays (the RFI signal and phase, the gains) carry no baseline axis
+# and are replicated: every device needs all of them to form its own baselines.
 
-# Array names whose *leading* axis is the RFI-source axis and which should therefore be
-# split across devices. Everything else (per-baseline data, per-antenna gains, ast
-# params, component constants) is replicated. Constants are keyed "<prefix>/<name>" in
-# the model, so matching happens on the part after the last "/". Membership here is not
-# sufficient on its own: shard_pytree additionally requires leaf.shape[0] == n_rfi, so
-# a constant whose leading dimension is a basis size of its own could not be sharded
-# even if a future rename made its name match.
-RFI_AXIS_NAMES = frozenset({
-    # latent params (optimized)
-    "rfi_k_r_base", "rfi_k_i_base",
-    "rfi_orbit_base",
-    # state buffers
-    "rfi_A", "rfi_phase", "rfi_xyz", "elements",
-    # (n_rfi, n_ant, n_time, n_path) delay polynomial of the data-grid route,
-    # read beside rfi_A and rfi_phase by rfi_vis:AnalyticVis
-    "rfi_delay_poly_us",
-    # constants
-    "mu_rfi_k", "mu_rfi_orbit", "L_rfi_orbit",
-    # (n_rfi, n_time_fine) elevation mask, multiplied into rfi_A in the signal
-    # forwards. Sharded rather than replicated so that multiply stays elementwise
-    # within each shard -- replicated, it would pull rfi_A back to a full copy.
-    "rfi_mask_fine",
-    # (n_rfi, n_time) elevation mask of rfi_vis:AnalyticVis, which scans each
-    # shard's own sources
-    "rfi_mask",
+#: The one axis of the device mesh.
+BASELINE_AXIS = "bl"
+
+# Array names whose *leading* axis is the baseline axis and which are therefore
+# split across devices. Everything else (per-source RFI arrays, per-antenna gains,
+# component constants) is replicated. Constants are keyed "<prefix>/<name>" in the
+# model, so matching happens on the part after the last "/". Membership is not
+# sufficient on its own: the leading dimension must also be the baseline count, so
+# an array whose first axis merely shares the name is never split by accident, and
+# that count must divide by the device count (see :func:`baselines_divide`).
+BASELINE_AXIS_NAMES = frozenset({
+    # the visibilities the components accumulate into, and their sum
+    "vis_ast", "vis_rfi", "vis_obs",
+    # ast_vis:GPVisAst's per-baseline latents and their prior
+    "ast_k_r_base", "ast_k_i_base", "sigma_ast_k", "mu_ast_k",
 })
+
+#: Prefix of a constant that holds one row per *device* rather than per baseline:
+#: the index tables each device hands the RFI visibility kernels for its own
+#: baselines (see :func:`split_baselines`). Its leading axis is the device count,
+#: split one row to a device.
+DEVICE_ROWS_PREFIX = "dev_"
 
 
 @lru_cache(maxsize=None)
-def rfi_mesh() -> Mesh:
-    """The single 1-D device mesh used for RFI-axis sharding.
+def mesh() -> Mesh:
+    """The single 1-D device mesh, one axis named ``"bl"``.
 
-    Spans *all* global devices with one axis named ``"rfi"``, which covers both the
-    single-process multi-GPU layout and the multi-process one-GPU-per-process layout
-    uniformly. Cached: every caller must use the same mesh object so shardings compare
-    equal and jit avoids spurious recompiles.
+    Spans *all* global devices, which covers both the single-process multi-GPU
+    layout and the multi-process one-GPU-per-process layout uniformly. Cached:
+    every caller must use the same mesh object so shardings compare equal and
+    jit avoids spurious recompiles.
     """
-    return Mesh(np.array(jax.devices()), ("rfi",))
+    return Mesh(np.array(jax.devices()), (BASELINE_AXIS,))
 
 
-def rfi_sharding() -> NamedSharding:
-    """Sharding that splits an array's leading (RFI-source) axis across the mesh."""
-    return NamedSharding(rfi_mesh(), P("rfi"))
+def baseline_sharding() -> NamedSharding:
+    """Split an array's leading axis -- baselines, or device rows -- over the mesh."""
+    return NamedSharding(mesh(), P(BASELINE_AXIS))
 
 
 def replicated_sharding() -> NamedSharding:
     """Sharding that replicates an array on every device of the mesh."""
-    return NamedSharding(rfi_mesh(), P())
+    return NamedSharding(mesh(), P())
 
 
-def padded_rfi_count(n_rfi: int) -> int:
-    """Smallest multiple of the device count >= ``n_rfi``; ``n_rfi`` when not sharding.
+def baselines_divide(n_bl: int) -> bool:
+    """Whether a sharded run can split ``n_bl`` baselines evenly over the devices.
 
-    The RFI axis must divide evenly across the mesh, so TabConfig pads the satellite
-    list up to this count with dark dummy sources (zero prior mean and zero init on
-    their signal latents, hence exactly zero signal and zero gradient forever).
+    It holds for a full array of an even device count -- ``n(n-1)/2`` for 256,
+    384 and 512 stations is 32640, 73536 and 130816, each a multiple of four --
+    but not necessarily for a flagged or selected subset. Where it fails, the
+    visibility-shaped arrays stay replicated between components: the run is
+    still correct, and still divides the RFI visibility work, but saves no
+    memory on them. False whenever sharding is off.
     """
-    if not sharding_enabled():
-        return n_rfi
-    n_dev = jax.device_count()
-    return n_rfi + (-n_rfi) % n_dev
+    return sharding_enabled() and n_bl % jax.device_count() == 0
 
 
 def make_global(x, sharding: NamedSharding) -> jax.Array:
-    """Build a (possibly multi-process) global array from a full per-process host copy.
+    """Globalize a full per-process copy, or reshard an existing global array.
 
-    Every process holds the complete array (they all read the same MS / run the same
-    setup), so the callback just slices the requested shard out of the local copy. This
-    is the supported construction path in both single-process multi-device and
-    multi-process layouts, unlike ``jax.device_put`` which historically rejects
-    cross-process shardings.
+    Every process holds the complete array (they all read the same MS / run the
+    same setup), so the callback just slices the requested shard out of the
+    local copy. This is the supported construction path in both single-process
+    multi-device and multi-process layouts, unlike ``jax.device_put`` which
+    historically rejects cross-process shardings.
+
+    A global array that is already on the mesh is resharded collectively rather
+    than fetched through numpy, which a process holding only part of it cannot do.
     """
+    if isinstance(x, jax.Array):
+        if x.sharding == sharding:
+            return x
+        if getattr(x.sharding, "mesh", None) == sharding.mesh:
+            return jax.jit(lambda value: value, out_shardings=sharding)(x)
     x_np = np.asarray(x)
     return jax.make_array_from_callback(x_np.shape, sharding, lambda idx: x_np[idx])
 
 
-def _wants_rfi_axis(key: str, leaf, n_rfi: int) -> bool:
+def _placement(key: str, leaf, n_bl: int) -> NamedSharding:
+    """Where a model array lives: split over baselines or device rows, else whole."""
     name = key.rsplit("/", 1)[-1]
-    return name in RFI_AXIS_NAMES and np.ndim(leaf) >= 1 and np.shape(leaf)[0] == n_rfi
+    if np.ndim(leaf) >= 1:
+        if name.startswith(DEVICE_ROWS_PREFIX) and np.shape(leaf)[0] == jax.device_count():
+            return baseline_sharding()
+        if (
+            name in BASELINE_AXIS_NAMES
+            and np.shape(leaf)[0] == n_bl
+            and baselines_divide(n_bl)
+        ):
+            return baseline_sharding()
+    return replicated_sharding()
 
 
-def shard_pytree(tree: dict, n_rfi: int) -> dict:
-    """Device-put a flat dict of arrays: RFI-axis entries sharded, the rest replicated.
+def shard_pytree(tree: dict, n_bl: int) -> dict:
+    """Place a flat dict of model arrays on the mesh.
 
-    Identity when sharding is off. Leaves that already carry the requested sharding
-    (e.g. placeholders created via :func:`sharded_rfi_zeros`) are passed through
-    untouched -- rebuilding them from a host copy would defeat their purpose of never
-    existing as a full single-device array.
+    Per-baseline arrays (:data:`BASELINE_AXIS_NAMES`) and per-device index rows
+    (:data:`DEVICE_ROWS_PREFIX`) are split along their leading axis; everything
+    else is replicated. Parameters, state and constants share the layout, so
+    the gradients and the optimiser's buffers follow it too.
+
+    Identity when sharding is off. Leaves that already carry the requested
+    sharding (e.g. placeholders created by :func:`replicated_zeros`) are passed
+    through untouched.
     """
     if not sharding_enabled():
         return tree
 
     out = {}
     for key, leaf in tree.items():
-        want = rfi_sharding() if _wants_rfi_axis(key, leaf, n_rfi) else replicated_sharding()
+        want = _placement(key, leaf, n_bl)
         if isinstance(leaf, jax.Array) and leaf.sharding == want:
             out[key] = leaf
         else:
@@ -215,50 +241,46 @@ def shard_pytree(tree: dict, n_rfi: int) -> dict:
 def replicate_off_mesh(tree):
     """Replicate every leaf of ``tree`` that is not yet placed on the mesh.
 
-    Leaves already on :func:`rfi_mesh` keep their sharding. The rest -- the
-    scalars a fresh optax state creates on one device, its step count among
-    them -- are replicated, which is how a jitted step returns them. Without
-    this the second step sees inputs placed differently from the first and
-    compiles again. Identity when sharding is off.
+    Leaves already on :func:`mesh` keep their sharding. The rest -- the scalars
+    a fresh optax state creates on one device, its step count among them -- are
+    replicated, which is how a jitted step returns them. Without this the
+    second step sees inputs placed differently from the first and compiles
+    again. Identity when sharding is off.
     """
     if not sharding_enabled():
         return tree
-    mesh = rfi_mesh()
+    the_mesh = mesh()
 
     def place(leaf):
-        if isinstance(leaf, jax.Array) and getattr(leaf.sharding, "mesh", None) == mesh:
+        if isinstance(leaf, jax.Array) and getattr(leaf.sharding, "mesh", None) == the_mesh:
             return leaf
         return make_global(leaf, replicated_sharding())
 
     return jax.tree_util.tree_map(place, tree)
 
 
-def constrain_prediction(pred: dict, n_rfi: int) -> dict:
-    """Pin one-sample ``Predictive`` output inside traced code, as the writers read it.
+def constrain_prediction(pred: dict) -> dict:
+    """Replicate one-sample ``Predictive`` output inside traced code.
 
-    Per-RFI sites (leading sample axis, then the RFI axis) stay split across the
-    mesh; everything else is replicated, so process 0 can read it without a
-    gather. No-op when sharding is off.
+    Every site is written out by process 0, which can only read an array it
+    holds whole, so the visibilities are gathered here, once, inside the
+    compiled prediction rather than by each writer. No-op when sharding is off.
     """
     if not sharding_enabled():
         return pred
-    split = NamedSharding(rfi_mesh(), P(None, "rfi"))
     return {
-        key: lax.with_sharding_constraint(
-            leaf,
-            split if np.ndim(leaf) >= 2 and _wants_rfi_axis(key, leaf[0], n_rfi)
-            else replicated_sharding(),
-        )
+        key: lax.with_sharding_constraint(leaf, replicated_sharding())
         for key, leaf in pred.items()
     }
 
 
-def sharded_rfi_zeros(shape: tuple, dtype) -> jax.Array:
-    """Zeros with the leading (RFI) axis sharded, without a full single-device copy.
+def replicated_zeros(shape: tuple, dtype) -> jax.Array:
+    """Zeros on every device of the mesh, without a single-device copy first.
 
-    Used for the big ``rfi_A``/``rfi_phase`` state placeholders: each device only ever
-    allocates its own shard, which is what lets a run hold more RFI sources than one
-    GPU fits. Plain ``jnp.zeros`` when sharding is off.
+    Used for the large per-source state placeholders (``rfi_A``, ``rfi_phase``):
+    every device holds them whole under baseline sharding, and building them
+    through ``jnp.zeros`` would first allocate a full extra copy on device 0.
+    Plain ``jnp.zeros`` when sharding is off.
     """
     if not sharding_enabled():
         return jnp.zeros(shape, dtype=dtype)
@@ -266,9 +288,8 @@ def sharded_rfi_zeros(shape: tuple, dtype) -> jax.Array:
     # under f32): numpy would otherwise hand the callback f64/c128 buffers that
     # disagree with the array dtype jax expects when x64 is off.
     dtype = jnp.zeros((), dtype=dtype).dtype
-    sharding = rfi_sharding()
     return jax.make_array_from_callback(
-        tuple(shape), sharding, lambda idx: np.zeros(_index_shape(shape, idx), dtype=dtype)
+        tuple(shape), replicated_sharding(), lambda idx: np.zeros(_index_shape(shape, idx), dtype=dtype)
     )
 
 
@@ -279,56 +300,123 @@ def _index_shape(shape, idx) -> tuple:
     )
 
 
-def constrain_rfi_state(state: dict, n_rfi: int) -> dict:
-    """Pin per-RFI state entries to the RFI sharding inside traced code.
+def constrain_baseline_state(state: dict, n_bl: int) -> dict:
+    """Pin every per-baseline state entry to the baseline sharding in traced code.
 
-    Called between component forwards so XLA keeps ``rfi_A``/``rfi_phase`` (the
-    fine-grid memory hogs) split across devices instead of ever materializing a
-    replicated copy. No-op when sharding is off.
+    The RFI visibility comes out of :func:`map_over_baselines` already divided,
+    but the sky model and the gains are ordinary JAX built from parameters that
+    are partly replicated, so XLA has no reason of its own to divide what they
+    produce: it can compute a whole ``(n_bl, n_freq, n_time)`` array on every
+    device and reshard it to add the two together. Saying where these belong,
+    between components, keeps the whole forward on one layout. No-op unless
+    the baselines divide over a sharded run.
     """
-    if not sharding_enabled():
+    if not baselines_divide(n_bl):
         return state
-    sharding = rfi_sharding()
+    sharding = baseline_sharding()
     out = dict(state)
     for key, leaf in state.items():
-        if _wants_rfi_axis(key, leaf, n_rfi):
+        name = key.rsplit("/", 1)[-1]
+        if name in BASELINE_AXIS_NAMES and np.ndim(leaf) >= 1 and leaf.shape[0] == n_bl:
             out[key] = lax.with_sharding_constraint(leaf, sharding)
     return out
 
 
-def psum_over_rfi(local_fn: Callable) -> Callable:
-    """Map a per-RFI-shard visibility function over the mesh and sum across shards.
+def constrain_baseline_axis(x, axis: int):
+    """Pin an array whose baseline axis is not the leading one.
 
-    ``local_fn(*per_source) -> vis`` takes arrays whose leading axis is the RFI
-    source axis -- ``(rfi_A, rfi_phase)`` on the fine grid, with
-    ``rfi_delay_poly_us`` beside them on the data grid -- must accept any leading
-    RFI count, and returns an array with **no** RFI axis (its local sources already
-    summed). Under sharding it runs per device on the local shard via ``shard_map``
-    -- which is also what lets the FFI custom op participate, since GSPMD cannot
-    partition a custom call -- and the small coarse-grid results are ``psum``-ed
-    into a replicated total. Unsharded it is ``local_fn`` itself, keeping the
-    single-device path bitwise identical.
+    The likelihood stacks the real and imaginary parts before comparing them,
+    which puts the baseline axis second, out of reach of a constraint written
+    for the leading one. Everything downstream of that stack -- the
+    log-probability, the mask, and the cotangents of all three -- is then free
+    to be computed whole on every device. No-op unless that axis divides over a
+    sharded run.
+    """
+    if not baselines_divide(x.shape[axis]):
+        return x
+    spec = [None] * x.ndim
+    spec[axis] = BASELINE_AXIS
+    return lax.with_sharding_constraint(x, NamedSharding(mesh(), P(*spec)))
+
+
+def map_over_baselines(local_fn: Callable, in_specs, out_specs=P(BASELINE_AXIS)) -> Callable:
+    """Map a per-device function over the baseline mesh, with no reduction.
+
+    ``in_specs`` says which arguments are split: ``P("bl")`` for the per-device
+    index rows (see :func:`split_baselines`), ``P()`` for the per-source and
+    per-antenna inputs every device needs whole. Each device computes the rows
+    of its own block, and the blocks concatenate into the result -- nothing is
+    summed across devices. ``shard_map`` is also what lets the FFI custom calls
+    run at all, since GSPMD cannot partition a custom call.
+
+    Reverse mode does reduce: the cotangent of a replicated input is the sum of
+    every device's share, which ``shard_map`` forms with a ``psum`` in the
+    transpose. That requires varying-axis checking to be off, which the
+    ``ri_kernels`` primitives insist on: they do not track the varying axes, and
+    with checking on the transpose would skip that ``psum`` and return wrong
+    gradients.
+
+    Unsharded it is ``local_fn`` itself, keeping the single-device path free of
+    any mapping.
     """
     if not sharding_enabled():
         return local_fn
 
-    def summed(*per_source):
-        return lax.psum(local_fn(*per_source), "rfi")
+    kwargs = dict(mesh=mesh(), in_specs=in_specs, out_specs=out_specs)
+    try:
+        return shard_map(local_fn, check_vma=False, **kwargs)
+    except TypeError:  # pragma: no cover - jax < 0.7 spells it check_rep
+        return shard_map(local_fn, check_rep=False, **kwargs)
 
-    def mapped(*per_source):
-        # Varying-axis type checking must be off: the FFI kernel's custom
-        # JVP/transpose rules produce cotangents without the {V:rfi} annotation,
-        # which trips the check under value_and_grad. The out_specs still hold --
-        # the psum makes the result replicated -- the checker just cannot prove it
-        # for custom primitives.
-        kwargs = dict(mesh=rfi_mesh(), in_specs=(P("rfi"),) * len(per_source), out_specs=P())
-        try:
-            fn = shard_map(summed, check_vma=False, **kwargs)
-        except TypeError:  # pragma: no cover - jax < 0.7 spells it check_rep
-            fn = shard_map(summed, check_rep=False, **kwargs)
-        return fn(*per_source)
 
-    return mapped
+@dataclass(frozen=True)
+class DeviceSplit:
+    """A list of baselines divided between the devices that own their rows.
+
+    Device ``d`` owns rows ``[d * block, (d + 1) * block)`` of the visibility
+    axis. ``members[d]`` indexes the entries of the list that fall in that
+    block, in list order, and ``positions[d]`` gives their rows within it,
+    padded up to ``width`` -- the most any one device owns -- with ``block``:
+    a spare row past the end of the block, which a padded entry is written to
+    and then dropped with. Every device then computes the same number of
+    baselines, which is what ``shard_map`` requires.
+    """
+
+    block: int
+    width: int
+    members: tuple
+    positions: np.ndarray
+
+    @property
+    def padded(self) -> bool:
+        """Whether any device computes a padded entry."""
+        return any(len(m) < self.width for m in self.members)
+
+
+def baseline_block(n_bl: int, n_dev: int | None = None) -> int:
+    """Rows of the visibility axis each device owns; the last may own fewer."""
+    n_dev = jax.device_count() if n_dev is None else n_dev
+    return -(-n_bl // n_dev)
+
+
+def split_baselines(rows, n_bl: int, n_dev: int | None = None) -> DeviceSplit:
+    """Divide the baselines ``rows`` (indices into ``n_bl``) by the device owning each.
+
+    ``rows`` is the whole visibility axis for a component that computes every
+    baseline at once, or one group of it for a component that computes its
+    baselines in groups (``rfi_vis:RiemannVisVariableFine``). One device when
+    sharding is off, so the same plan serves both.
+    """
+    n_dev = (jax.device_count() if sharding_enabled() else 1) if n_dev is None else n_dev
+    rows = np.asarray(rows, dtype=np.int64)
+    block = baseline_block(n_bl, n_dev)
+    owner = rows // block
+    members = tuple(np.flatnonzero(owner == d) for d in range(n_dev))
+    width = max(len(m) for m in members)
+    positions = np.full((n_dev, width), block, dtype=np.int32)
+    for d, m in enumerate(members):
+        positions[d, : len(m)] = rows[m] - d * block
+    return DeviceSplit(block, width, members, positions)
 
 
 # ---------------------------------------------------------------------------

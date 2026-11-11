@@ -2,9 +2,12 @@ from tabascal.imports import import_components
 from tabascal.components import rfi_grid, validate_component_order
 from tabascal.components.likelihood import gaussian
 from tabascal.distributed import (
-    constrain_rfi_state,
+    baseline_sharding,
+    baselines_divide,
+    constrain_baseline_state,
     make_global,
     replicated_sharding,
+    shard_pytree,
     sharding_enabled,
 )
 from tabascal.gain_table import gains_from_tables, normalise_gain_tables
@@ -243,7 +246,10 @@ class TabConfig:
             # These are captured in closures during Model setup (likelihood) and used
             # eagerly against globally-sharded arrays; process-local device arrays
             # cannot mix with global ones in multi-process, so globalize them here,
-            # before any component sees them.
+            # before any component sees them. Whole on every device: the
+            # components' setup reads them on the host, which a process holding
+            # only its own baselines could not do. Model splits vis_obs over the
+            # baselines once that is done (see place_observations).
             self.vis_obs = make_global(self.vis_obs, replicated_sharding())
             self.flags = make_global(self.flags, replicated_sharding())
             self.ms_flags = make_global(self.ms_flags, replicated_sharding())
@@ -258,15 +264,32 @@ class TabConfig:
                     self.gain_flags, replicated_sharding()
                 )
             # Was float(self.noise), which a resolved noise array cannot survive.
-            # Replicated rather than sharded: it is one array indexed by baseline
-            # (and channel, and timestep where the MS resolves the noise that
-            # far), and every process needs all of it -- at most the size of
-            # vis_obs, which is replicated beside it. A scalar override goes
-            # through unchanged, as a 0-d global array.
+            # Replicated rather than split: the likelihood closes over it, which
+            # a compiled function may not do with an array split across
+            # processes. A scalar override goes through unchanged, as a 0-d
+            # global array.
             if self.noise is not None:
                 self.noise = make_global(
                     jnp.asarray(self.noise), replicated_sharding()
                 )
+
+    def place_observations(self):
+        """Split the observations over baselines, once the components are set up.
+
+        The fit compares the model with ``vis_obs``, and with it divided a device
+        holds the rows it fits and no more, as it does of the model's own
+        visibilities. Called by :class:`Model` once every component is set up --
+        setup reads the observations on the host, which needs them whole. A
+        no-op unless the baselines divide over a sharded run.
+
+        ``flags`` and ``noise`` stay whole: the likelihood closes over them, and
+        a compiled function may not close over an array split across processes.
+        The likelihood's sharding constraint still has each device compute on
+        its own rows of them. The setup-only masks (``ms_flags``,
+        ``estimator_flags``, ``gain_flags``) stay whole too.
+        """
+        if baselines_divide(self.n_bl):
+            self.vis_obs = make_global(self.vis_obs, baseline_sharding())
 
     def set_elevation_mask(
         self, min_elevation: Optional[float], require_in_view: bool = True
@@ -745,19 +768,8 @@ class TabConfig:
             self.epoch_jd,
             self.norad_ids,
             self.orbit_records,
-            self.n_rfi_real,
         ) = fetch_orbital_elements(resolution=self.tle_resolution)
-        # Under sharding the fetch pads the source list to a multiple of the device
-        # count by duplicating the last satellite. n_rfi_real is the pre-padding row
-        # count reported by the fetch (not inferred from the id list, which would be
-        # wrong if the real sources contain a repeated NORAD id); the RFI signal
-        # components use it to keep only the padded dummy sources dark.
         self.n_rfi = len(self.norad_ids)
-        if self.n_rfi > self.n_rfi_real:
-            print(
-                f"Padded {self.n_rfi_real} RFI sources to {self.n_rfi} "
-                "(dark dummies) to divide evenly across devices."
-            )
 
 
 # The state keys Model supplies itself, whatever the component list holds: the
@@ -775,16 +787,7 @@ class Model:
         likelihood: Callable = gaussian,
     ):
 
-        self.noise = tab_config.noise
         self.n_rfi = tab_config.n_rfi
-        self.likelihood = lambda pred, obs_data: likelihood(
-            pred,
-            obs_data,
-            {
-                "noise": broadcast_to_vis(tab_config.noise, tab_config.vis_obs.shape),
-                "flags": tab_config.flags,
-            },
-        )
 
         components = [C() for C in import_components(component_list)]
         self.components = components
@@ -798,6 +801,23 @@ class Model:
 
         for comp in components:
             comp.setup(tab_config)
+            # Components keep their output placeholders after assembly, so
+            # placing only Model.state below would leave the originals -- whole
+            # visibility cubes among them -- alive on device 0. Place the
+            # retained originals themselves, before anything takes a reference.
+            comp.state_outputs = shard_pytree(comp.state_outputs, tab_config.n_bl)
+
+        # Every reader of the whole observations on the host is done.
+        tab_config.place_observations()
+        self.noise = tab_config.noise
+        self.likelihood = lambda pred, obs_data: likelihood(
+            pred,
+            obs_data,
+            {
+                "noise": broadcast_to_vis(tab_config.noise, tab_config.vis_obs.shape),
+                "flags": tab_config.flags,
+            },
+        )
 
         init_params = [comp.init_params_base for comp in components]
         self.init_params = {k: v for d in init_params for k, v in d.items()}
@@ -822,16 +842,18 @@ class Model:
 
     def build_forward(self):
         forwards = [comp.build_forward() for comp in self.components]
-        n_rfi = self.n_rfi
+        # The baseline count the visibilities carry, read off the array itself.
+        n_bl = self.state["vis_obs"].shape[0]
 
         def forward(params, state, constants):
 
             for sub_forward in forwards:
                 state = sub_forward(params, state, constants)
-                # Keep the per-RFI fine grids (rfi_A/rfi_phase -- the memory hogs)
-                # pinned to the RFI sharding between components, so XLA never
-                # materializes a replicated copy. No-op on a single device.
-                state = constrain_rfi_state(state, n_rfi)
+                # Keep the visibilities divided over baselines from one
+                # component to the next, so each is computed on every device's
+                # own rows rather than whole and then resharded. No-op unless
+                # the baselines divide over a sharded run.
+                state = constrain_baseline_state(state, n_bl)
 
             return state
 

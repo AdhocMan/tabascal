@@ -3184,15 +3184,13 @@ def _resolve_records(norad_ids, times_jd, extra_orbit_dir):
             "whose satellites.norad_ids names them."
         )
 
-    _, _, ids, records, n_real = fetch_orbital_elements(
+    _, _, ids, records = fetch_orbital_elements(
         times_jd=JulianDate(times_jd),
         norad_ids=[int(n) for n in norad_ids],
         extra_orbit_dir=extra_orbit_dir,
     )
 
-    # Under sharding the fetch pads the source list with duplicates of the last
-    # satellite; a light curve is wanted for the real ones only.
-    return [int(n) for n in ids[:n_real]], list(records[:n_real])
+    return [int(n) for n in ids], list(records)
 
 
 def light_curves_from_config(
@@ -3208,10 +3206,6 @@ def light_curves_from_config(
     and orbit records the config has loaded, so no second MS read is needed, and
     the curves come back ordered to match ``satellites.norad_ids`` -- no title
     matching, and no light-curve file.
-
-    Curves are returned for the *real* satellites only. Under device sharding the
-    source axis is padded with duplicates of the last satellite, and those rows
-    are re-added as zeros by the seeding code that consumes this.
 
     The elevation cut is the run's own ``rfi.min_elevation`` mask, taken off the
     config rather than recomputed, so the estimate is masked exactly where the
@@ -3240,9 +3234,9 @@ def light_curves_from_config(
     if vis is None:
         vis = tab_config.vis_obs
 
-    n_real = getattr(tab_config, "n_rfi_real", len(tab_config.norad_ids))
-    norad_ids = [int(n) for n in tab_config.norad_ids[:n_real]]
-    records = list(tab_config.orbit_records[:n_real])
+    n_real = len(tab_config.norad_ids)
+    norad_ids = [int(n) for n in tab_config.norad_ids]
+    records = list(tab_config.orbit_records)
 
     times_jd = JulianDate(tab_config.times_jd)
     ants_itrf = np.asarray(tab_config.ants_itrf)

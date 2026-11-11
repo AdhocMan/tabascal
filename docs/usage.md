@@ -205,6 +205,36 @@ smallest footprint a run really needs and to find out where an out-of-memory
 error comes from. It frees only what is no longer live, so it will not make two
 overlapping peaks fit.
 
+### Sharding across several GPUs
+
+Sharding turns itself on when more than one device is visible, in one process
+or across a multi-process launch; there is no config key for it. A sharded run
+splits the **baseline axis**: each device owns a contiguous block of baselines,
+in the order the data already has, computes only those rows of the RFI and sky
+visibilities, and holds only those rows of the model's visibilities and of the
+observations. Nothing visibility-sized is summed across devices; only the scalar
+likelihood is reduced. The flags and a resolved noise array stay whole on every
+device: the likelihood is compiled around them, which it cannot be around an
+array split across processes. Each device still computes on its own rows of
+them.
+
+The per-source and per-antenna arrays carry no baseline axis, so every device
+holds them whole: the RFI signal and phase, the orbits, the gains. For a model
+on the fine grid (`rfi_vis:RiemannVisFine`, `RiemannVisVariableFine`) the RFI
+signal and phase are the largest arrays of the run, so it is the visibilities,
+not those, that sharding divides; `rfi_vis:AnalyticVis` keeps them on the data
+grid, where they are small.
+
+The visibilities split evenly when the baseline count divides by the device
+count, as it does for a complete array on an even number of devices — 256, 384
+and 512 antennas give 32640, 73536 and 130816 baselines, each a multiple of
+four — but not necessarily for a flagged or selected subset. Where it does not
+divide, the RFI visibility work is still divided — each device's share is
+padded to the same length, and the padding discarded — but the
+visibility-shaped arrays stay whole on every device between components. The
+result is the same either way; only the memory differs. A single-device run is
+unaffected.
+
 ## Extracting RFI light curves
 
 `tabascal light-curve` measures each satellite's apparent flux over time and

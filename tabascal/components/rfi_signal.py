@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from tabascal.components import Component, assert_attr_shape
 from tabascal.config import TabConfig
 from tabascal.dist import standard_normal
-from tabascal.distributed import sharded_rfi_zeros
+from tabascal.distributed import replicated_zeros
 from tabascal.ms import get_observation_data_type
 from tabascal.seeds import component_key, config_seed
 from tabascal.fft_gp import FROM_DATA, latent_to_signal_init, latent_to_signal, signal_to_latent_init, signal_to_latent, knee_from_corr_scale, rms_vis, validate_cutoff, validate_gp_cov, validate_signal_type
@@ -830,18 +830,10 @@ class BaseGPRFI(Component):
         self.corr_freq = gp_cov["corr_freq"]
         self.corr_time = gp_cov["corr_time"]
 
-        # Real (unpadded) source count. Under device sharding n_rfi is padded up to a
-        # multiple of the device count with dark dummy sources; every prior mean and
-        # init below zeroes rows [n_rfi_real:] so the dummies carry exactly zero
-        # amplitude and zero gradient (the vis contribution is quadratic in rfi_A).
-        self.n_rfi_real = getattr(tab_config, "n_rfi_real", tab_config.n_rfi)
-
         # Elevation mask, zeroing the RFI signal while a satellite is below the
-        # horizon. None when disabled. Shape (n_rfi, n_time_fine), i.e. it covers the
-        # padded dummy rows too -- they duplicate the last real satellite, so they
-        # inherit its mask and are zeroed independently by masked_forward_transform.
-        # Stored as a boolean, which is what jnp.where in the forward wants and is
-        # the smallest thing to shard. A data-grid signal is left unmasked:
+        # horizon. None when disabled. Shape (n_rfi, n_time_fine). Stored as a
+        # boolean, which is what jnp.where in the forward wants and is the
+        # smallest thing to hold. A data-grid signal is left unmasked:
         # rfi_vis:AnalyticVis interpolates it across the horizon and masks each
         # source's visibility instead.
         rfi_mask_fine = getattr(tab_config, "rfi_mask_fine", None) if self.supersample else None
@@ -849,8 +841,7 @@ class BaseGPRFI(Component):
             None if rfi_mask_fine is None else jnp.asarray(rfi_mask_fine, dtype=bool)
         )
 
-        # Ordered as the n_rfi axis. The tail entries are sharding duplicates, so
-        # consumers matching against a file slice to [:n_rfi_real] first.
+        # Ordered as the n_rfi axis.
         self.norad_ids = tab_config.norad_ids
 
     def build_mask_constants(self) -> dict:
@@ -858,10 +849,9 @@ class BaseGPRFI(Component):
 
         Kept separate from each component's own ``build_constants`` so the
         None-check lives in one place. The mask is a constant rather than a
-        closed-over array because it is indexed by ``n_rfi``: ``distributed.py``
-        shards constants named in ``RFI_AXIS_NAMES`` along the source axis, and a
-        captured array would instead be replicated, pulling ``rfi_A`` back to a
-        full copy on every device.
+        closed-over array so that, like every other model array, it is placed on
+        the device mesh by ``distributed.shard_pytree`` rather than captured
+        into the compiled step.
         """
         if self.rfi_mask_fine is None:
             return {}
@@ -870,16 +860,14 @@ class BaseGPRFI(Component):
     def build_masked_signal(self) -> Callable:
         """Return the signal-domain mask to apply at the end of a forward.
 
-        Sibling of :meth:`masked_forward_transform`, which zeroes the padded dummy
-        *sources* in the latent k-space. A time window cannot be expressed there:
-        zeroing global Fourier modes cannot produce a time-limited signal, so the
-        elevation mask has to be applied to ``rfi_A`` after ``latent_to_signal``.
+        A time window cannot be expressed in the latent k-space: zeroing global
+        Fourier modes cannot produce a time-limited signal, so the elevation mask
+        has to be applied to ``rfi_A`` after ``latent_to_signal``.
 
-        Both follow the same contract -- a base-class hook every component applies
-        unconditionally, which degrades to the identity when there is nothing to
-        mask (no elevation cut here, a single device there). Resolving the branch
-        here rather than inside the traced function means a run without an
-        elevation cut emits no mask op at all and pays nothing.
+        A base-class hook every component applies unconditionally, which degrades
+        to the identity when there is no elevation cut. Resolving the branch here
+        rather than inside the traced function means a run without one emits no
+        mask op at all and pays nothing.
 
         The returned function takes any array whose leading axis is ``n_rfi`` and
         whose trailing axis is ``n_time_fine``, so a component that keeps the
@@ -922,7 +910,7 @@ class BaseGPRFI(Component):
         light-curve sources -- a measured file and the matched filter -- differ
         only in where the curves come from, so both land here.
 
-        ``light_curves`` is ``(n_rfi_real, n_freq, n_time)`` on the observation
+        ``light_curves`` is ``(n_rfi, n_freq, n_time)`` on the observation
         grid, real from a file and complex from the filter. A non-finite sample
         is one nothing was measured in, and seeds at zero, which is what
         :func:`read_light_curves` already does to the file path's own.
@@ -933,16 +921,14 @@ class BaseGPRFI(Component):
             jnp.sqrt(A)[:, None], (A.shape[0], self._est_n_ant) + A.shape[1:]
         )
 
-        return self._zero_pad_rfi(vmap(vmap(self.signal_to_latent))(est_rfi_A))
+        return vmap(vmap(self.signal_to_latent))(est_rfi_A)
 
     def _read_estimate(self, est_path):
         """Seed from a measured light-curve file (``rfi.est``)."""
-        # Real satellites only; _zero_pad_rfi restores the padded rows as zeros,
-        # so a duplicate id is never reported as a missing one.
         return self._rfi_k_from_light_curves(
             read_light_curves(
                 est_path,
-                self.norad_ids[:self.n_rfi_real],
+                self.norad_ids,
                 self.est_times_mjd,
                 self.freqs,
             )
@@ -968,22 +954,6 @@ class BaseGPRFI(Component):
 
         return self._mf_rfi_k
 
-    def _mask_dummy_rfi(self, arr: Array) -> Array:
-        """Zero the padded (dark dummy) rows of an (n_rfi, ...) array; no-op unpadded."""
-        return arr.at[self.n_rfi_real:].set(0)
-
-    def _zero_pad_rfi(self, arr: Array) -> Array:
-        """Zero-pad axis 0 up to the (padded) n_rfi count; no-op when already there.
-
-        Truth/estimate sources (tab-sim zarr, estimate files) only know the real
-        satellites, so their arrays arrive with n_rfi_real rows.
-        """
-        n_pad = self.n_rfi - arr.shape[0]
-        if n_pad <= 0:
-            return arr
-        pad = jnp.zeros((n_pad,) + arr.shape[1:], dtype=arr.dtype)
-        return jnp.concatenate([arr, pad], axis=0)
-
     def _true_signal(self, rfi_A: Array) -> Array:
         """A simulated amplitude in this component's signal space.
 
@@ -1005,10 +975,10 @@ class BaseGPRFI(Component):
 
     def _set_outputs(self):
 
-        # This placeholder is a fine-grid memory hog; under sharding each device only
-        # ever allocates its own RFI shard (never the full array).
+        # A fine-grid memory hog, which every device holds whole under sharding:
+        # placed there directly rather than through a single-device copy.
         self.state_outputs = {
-            "rfi_A": sharded_rfi_zeros((self.n_rfi, self.n_ant, *self.signal_shape), complex),
+            "rfi_A": replicated_zeros((self.n_rfi, self.n_ant, *self.signal_shape), complex),
         }
 
     def _compute_gp_params(self):
@@ -1028,9 +998,6 @@ class BaseGPRFI(Component):
     def inv_transform(self, params, L, mu):
         pass
 
-    # helper function to set dummy rfi values to 0 for padding. Required for multi-device.
-    def masked_forward_transform(self, base_params, L, mu):
-        return self._mask_dummy_rfi(self.forward_transform(base_params, L, mu))
 class ComplexRFIVarAntFine(BaseGPRFI):
 
     required_inputs = {}  # No inputs needed
@@ -1048,7 +1015,6 @@ class ComplexRFIVarAntFine(BaseGPRFI):
         """All validation and error-prone operations here"""
         try:
             super().setup(tab_config)
-            self.vis_obs = tab_config.vis_obs
 
             self.time_pad_factor = tab_config.args["rfi"]["time_pad_factor"]
             self.freq_pad_factor = tab_config.args["rfi"]["freq_pad_factor"]
@@ -1126,7 +1092,7 @@ class ComplexRFIVarAntFine(BaseGPRFI):
         cost, with the optimised chi^2 unchanged to ~6 significant figures.
         """
         prefix = self.prefix
-        forward_transform = self.masked_forward_transform
+        forward_transform = self.forward_transform
         masked_signal = self.build_masked_signal()
         pads = self.pads
         ss_idxs = self.ss_idxs
@@ -1239,9 +1205,8 @@ class ComplexRFIVarAntFine(BaseGPRFI):
 
     def _compute_data_est(self, vis_obs):
 
-        # Split the data estimate over the *real* sources only; padded dummies get a
-        # zero mean so they stay dark.
-        est_rfi_k = self.signal_to_latent(jnp.sqrt(jnp.max(jnp.abs(vis_obs), axis=0)))[None, None, :, :] * jnp.ones((self.n_rfi, self.n_ant, 1, 1)) / self.n_rfi_real
+        # The data estimate, split evenly over the sources.
+        est_rfi_k = self.signal_to_latent(jnp.sqrt(jnp.max(jnp.abs(vis_obs), axis=0)))[None, None, :, :] * jnp.ones((self.n_rfi, self.n_ant, 1, 1)) / self.n_rfi
 
         return est_rfi_k
 
@@ -1278,9 +1243,8 @@ class ComplexRFIVarAntFine(BaseGPRFI):
 
     def _compute_true_params(self, sim_zarr_path: str, data_col: str):
 
-        # The zarr only knows the real satellites; zero-pad to the sharded count.
         rfi_A = self._true_signal(read_true_rfi_A(sim_zarr_path, data_col, self.times))
-        self.true_rfi_k_A = self._zero_pad_rfi(vmap(vmap(self.signal_to_latent))(rfi_A))
+        self.true_rfi_k_A = vmap(vmap(self.signal_to_latent))(rfi_A)
         self.true_rfi_k_A_base = self.inv_transform(self.true_rfi_k_A, self.sigma_rfi_k, self.mu_rfi_k)
 
     def _compute_init_params(self, init_type: str, est_path: str, tab_config=None):
@@ -1316,7 +1280,7 @@ class ComplexRFIVarAntFine(BaseGPRFI):
                 (self.n_rfi, self.n_ant, self.n_k_freq_rfi, self.n_k_time_rfi),
                 dtype=self._latent_dtype,
             )
-            self.init_rfi_k = self.masked_forward_transform(base_sample, self.sigma_rfi_k, self.mu_rfi_k)
+            self.init_rfi_k = self.forward_transform(base_sample, self.sigma_rfi_k, self.mu_rfi_k)
         else:
             raise ValueError(f"Provided init type: {init_type} is not valid. Choose from (prior, est, matched-filter, truth, zeros, ones, sample).")
 
@@ -1379,7 +1343,6 @@ class ComplexRFIConstAntFine(BaseGPRFI):
         """All validation and error-prone operations here"""
         try:
             super().setup(tab_config)
-            self.vis_obs = tab_config.vis_obs
 
             self.time_pad_factor = tab_config.args["rfi"]["time_pad_factor"]
             self.freq_pad_factor = tab_config.args["rfi"]["freq_pad_factor"]
@@ -1437,7 +1400,7 @@ class ComplexRFIConstAntFine(BaseGPRFI):
     def build_forward(self):
         """Return pure, JIT-compatible function"""
         prefix = self.prefix
-        forward_transform = self.masked_forward_transform
+        forward_transform = self.forward_transform
         masked_signal = self.build_masked_signal()
         pads = self.pads
         ss_idxs = self.ss_idxs
@@ -1548,8 +1511,8 @@ class ComplexRFIConstAntFine(BaseGPRFI):
 
         # est_vis_rfi is shape (n_freq, n_time)
         # RFI antenna estimate is sqrt of average visibility amplitude on maximum baseline.
-        # Split over the *real* sources only; padded dummies get a zero mean.
-        est_rfi_A = jnp.sqrt(jnp.max(jnp.abs(vis_obs / self.n_rfi_real), axis=0))
+        # Split evenly over the sources.
+        est_rfi_A = jnp.sqrt(jnp.max(jnp.abs(vis_obs / self.n_rfi), axis=0))
         # est_rfi_k_A is shape (n_k_freq_rfi, n_k_time_rfi)
         est_rfi_k_A = self.signal_to_latent(est_rfi_A)
         # est_rfi_k_A is now shape (n_rfi, 1, n_k_freq_rfi, n_k_time_rfi)
@@ -1597,8 +1560,7 @@ class ComplexRFIConstAntFine(BaseGPRFI):
 
         # true_rfi_k_A is shape (n_rfi, 1, n_k_freq_rfi, n_k_time_rfi)
         # Latent prediction is mapped over axes (0, 1)
-        # The zarr only knows the real satellites; zero-pad to the sharded count.
-        self.true_rfi_k_A = self._zero_pad_rfi(vmap(vmap(self.signal_to_latent))(true_rfi_A))
+        self.true_rfi_k_A = vmap(vmap(self.signal_to_latent))(true_rfi_A)
 
         self.true_rfi_k_A_base = self.inv_transform(self.true_rfi_k_A, self.sigma_rfi_k, self.mu_rfi_k)
 
@@ -1638,7 +1600,7 @@ class ComplexRFIConstAntFine(BaseGPRFI):
                 (self.n_rfi, 1, self.n_k_freq_rfi, self.n_k_time_rfi),
                 dtype=self._latent_dtype,
             )
-            self.init_rfi_k = self.masked_forward_transform(base_sample, self.sigma_rfi_k, self.mu_rfi_k)
+            self.init_rfi_k = self.forward_transform(base_sample, self.sigma_rfi_k, self.mu_rfi_k)
         else:
             raise ValueError(f"Provided init type: {init_type} is not valid. Choose from (prior, est, matched-filter, truth, zeros, ones, sample).")
 

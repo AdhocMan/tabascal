@@ -2,9 +2,8 @@ from tabascal.orbit import TLEError, get_tles_by_id
 from satchecker_client.records import KIND_TLE, record_elements, record_kind
 from tabascal.distributed import (
     make_global,
-    padded_rfi_count,
-    rfi_sharding,
-    sharded_rfi_zeros,
+    replicated_sharding,
+    replicated_zeros,
     sharding_enabled,
 )
 from tabascal.dist import standard_normal
@@ -232,9 +231,10 @@ class PhaseCalculationRFIFine(Component):
     
     def _set_outputs(self):
 
-        # Fine-grid memory hog; under sharding each device only allocates its RFI shard.
+        # Fine-grid memory hog, which every device holds whole under sharding:
+        # placed there directly rather than through a single-device copy.
         self.state_outputs = {
-            "rfi_phase": sharded_rfi_zeros(
+            "rfi_phase": replicated_zeros(
                 (self.n_rfi, self.n_ant, self.n_freq_fine, self.n_time_fine), None
             ),
         }
@@ -328,14 +328,14 @@ class FixedOrbitFine(Component):
         # compile) and accurate. jnp.array casts to the active precision (f64/f32).
         self.ants_uvw = tracking_uvw(self.ants_itrf, self.times_jd_fine, self.phase_centre)
         # Fine-grid constant and the biggest array of this component: under sharding
-        # it is created directly with the RFI-axis sharding so the full array only
-        # ever exists in host numpy, never on a single device.
+        # every device holds it whole, and it is placed there directly from host
+        # numpy rather than through a single-device copy first.
         rfi_phase_np = get_rfi_phase_numpy(
             self.rfi_xyz, self.ants_uvw, self.ants_xyz, self.freqs_fine
         )
         if sharding_enabled():
             dtype = jnp.zeros((), dtype=None).dtype  # match the active precision
-            self.rfi_phase = make_global(rfi_phase_np.astype(dtype), rfi_sharding())
+            self.rfi_phase = make_global(rfi_phase_np.astype(dtype), replicated_sharding())
         else:
             self.rfi_phase = jnp.array(rfi_phase_np)
 
@@ -548,8 +548,10 @@ class FixedOrbit(Component):
 
         if sharding_enabled():
             dtype = jnp.zeros((), dtype=None).dtype  # match the active precision
-            self.rfi_phase = make_global(rfi_phase.astype(dtype), rfi_sharding())
-            self.rfi_delay_poly_us = make_global(rfi_delay_poly_us.astype(dtype), rfi_sharding())
+            self.rfi_phase = make_global(rfi_phase.astype(dtype), replicated_sharding())
+            self.rfi_delay_poly_us = make_global(
+                rfi_delay_poly_us.astype(dtype), replicated_sharding()
+            )
         else:
             self.rfi_phase = jnp.array(rfi_phase)
             self.rfi_delay_poly_us = jnp.array(rfi_delay_poly_us)
@@ -1013,25 +1015,6 @@ def itrs_to_gcrs_sf(pos_itrs: NDArray, times_jd: NDArray) -> NDArray:
     return pos_gcrs
 
 
-def _pad_rfi_sources(tles_df):
-    """Pad the fetched TLE set to a multiple of the device count under sharding.
-
-    The RFI axis is split evenly across devices, so when the satellite count does not
-    divide, the last satellite's row is duplicated up to :func:`padded_rfi_count`.
-    Padded sources are made *dark* by the RFI signal components (zero prior mean and
-    zero init on their amplitude latents): the visibility contribution is quadratic in
-    the amplitude, so both their signal and their gradient are exactly zero and the
-    solve is unchanged. Both orbital-element fetch paths (TabConfig and the SGP4
-    components' own re-fetch) go through here, so every consumer sees the same padded
-    count. No-op single-device or when the count already divides.
-    """
-    n_pad = padded_rfi_count(len(tles_df)) - len(tles_df)
-    if n_pad == 0 or len(tles_df) == 0:
-        return tles_df
-    import pandas as pd
-    return pd.concat([tles_df, *([tles_df.iloc[[-1]]] * n_pad)], ignore_index=True)
-
-
 def _orbit_records(tles_df) -> list[dict]:
     """The resolved frame as a list of raw records, one per source, in row order.
 
@@ -1131,20 +1114,15 @@ def fetch_orbital_elements(
         extra_orbit_max_age_days,
     )
     if _requested_nothing(norad_ids):
-        return (*_no_satellites(), 0)
+        return _no_satellites()
     _require_tles(tles_df, norad_ids)
-    # Real (unpadded) source count is the number of rows the fetch actually returned,
-    # captured before padding. Inferring it from the padded id list (e.g. counting
-    # distinct ids) is wrong when the real sources already contain a repeated NORAD id.
-    n_rfi_real = len(tles_df)
-    tles_df = _pad_rfi_sources(tles_df)
 
     elements = jnp.atleast_2d(tles_df[_ELEMENT_COLUMNS].values)
     epoch_jd = jnp.atleast_1d(tles_df["EPOCH_JD"].values)  # type: ignore
     norad_ids = list(tles_df["NORAD_CAT_ID"].values)
     orbit_records = _orbit_records(tles_df)
 
-    return elements, epoch_jd, norad_ids, orbit_records, n_rfi_real
+    return elements, epoch_jd, norad_ids, orbit_records
 
 def _resolved_frame(
     resolution,
@@ -1187,7 +1165,6 @@ def fetch_standard_orbital_elements(
         extra_orbit_max_age_days,
     )
     _require_tles(tles_df, norad_ids)
-    tles_df = _pad_rfi_sources(tles_df)
 
     # tles_df carries the OMM-style element columns derived locally by
     # satchecker_client.records.record_elements (degrees, rev/day, km), plus

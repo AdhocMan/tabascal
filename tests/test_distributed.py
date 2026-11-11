@@ -1,4 +1,4 @@
-"""Unit tests for the RFI-axis sharding helpers in tabascal.distributed.
+"""Unit tests for the baseline-axis sharding helpers in tabascal.distributed.
 
 Two regimes:
 
@@ -32,33 +32,43 @@ def test_sharding_disabled_single_device():
     assert not dist.sharding_enabled()
 
 
-def test_padded_rfi_count_identity_single_device():
+def test_baselines_never_divide_single_device():
     for n in (1, 3, 32):
-        assert dist.padded_rfi_count(n) == n
+        assert not dist.baselines_divide(n)
 
 
 def test_shard_pytree_identity_single_device():
-    tree = {"rfi_A": jnp.zeros((3, 2)), "other": jnp.ones(4)}
+    tree = {"vis_rfi": jnp.zeros((3, 2)), "other": jnp.ones(4)}
     assert dist.shard_pytree(tree, 3) is tree
 
 
-def test_sharded_rfi_zeros_single_device():
-    z = dist.sharded_rfi_zeros((3, 2), complex)
+def test_replicated_zeros_single_device():
+    z = dist.replicated_zeros((3, 2), complex)
     assert z.shape == (3, 2)
     assert z.dtype == jnp.zeros((1,), dtype=complex).dtype
     np.testing.assert_array_equal(np.asarray(z), 0)
 
 
-def test_constrain_rfi_state_identity_single_device():
-    state = {"rfi_A": jnp.zeros((3, 2))}
-    assert dist.constrain_rfi_state(state, 3) is state
+def test_constraints_identity_single_device():
+    state = {"vis_rfi": jnp.zeros((4, 2))}
+    assert dist.constrain_baseline_state(state, 4) is state
+    x = jnp.zeros((2, 4, 3))
+    assert dist.constrain_baseline_axis(x, 1) is x
+    pred = {"vis_obs": jnp.zeros((1, 4))}
+    assert dist.constrain_prediction(pred) is pred
 
 
-def test_psum_over_rfi_passthrough_single_device():
+def test_map_over_baselines_passthrough_single_device():
     def local_vis(a, p):
         return jnp.sum(a * p, axis=0)
 
-    assert dist.psum_over_rfi(local_vis) is local_vis
+    assert dist.map_over_baselines(local_vis, in_specs=()) is local_vis
+
+
+def test_split_baselines_single_device_is_the_whole_list():
+    split = dist.split_baselines(np.arange(6), 6)
+    assert (split.block, split.width, split.padded) == (6, 6, False)
+    np.testing.assert_array_equal(split.positions, [np.arange(6)])
 
 
 def test_barrier_and_rank0_first_single_process():
@@ -109,21 +119,23 @@ def test_broadcast_bytes_casts_a_widened_collective_result(monkeypatch):
 # Name/shape matching rules
 # ---------------------------------------------------------------------------
 
-def test_wants_rfi_axis_matching():
-    n_rfi = 3
-    # plain param key
-    assert dist._wants_rfi_axis("rfi_k_r_base", np.zeros((3, 4)), n_rfi)
-    # prefixed constant key matches on the segment after the last "/"
-    assert dist._wants_rfi_axis("_c/ComplexRFIVarAntFine/mu_rfi_k", np.zeros((3, 4)), n_rfi)
-    # right name, wrong leading dim -> replicated
-    assert not dist._wants_rfi_axis("rfi_A", np.zeros((5, 4)), n_rfi)
-    # A component constant that is not in the name list stays replicated, even when
-    # its leading dimension happens to equal n_rfi
-    assert not dist._wants_rfi_axis("_c/ConstGains/amp_basis", np.zeros((3, 2)), n_rfi)
-    # non-RFI names never shard
-    assert not dist._wants_rfi_axis("ast_k_r_base", np.zeros((3, 4)), n_rfi)
-    # scalars never shard
-    assert not dist._wants_rfi_axis("rfi_A", np.float64(0.0), n_rfi)
+def test_split_baselines_pads_every_device_to_the_widest():
+    """Device d owns rows [d*block, (d+1)*block); fewer than the widest are padded."""
+    # 10 baselines over 4 devices: blocks of 3, the last device owning row 9 only.
+    split = dist.split_baselines(np.arange(10), 10, n_dev=4)
+    assert (split.block, split.width, split.padded) == (3, 3, True)
+    assert [m.tolist() for m in split.members] == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+    np.testing.assert_array_equal(
+        split.positions, [[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 3, 3]]
+    )
+
+    # A group scattered over the axis: members index the group, positions the block.
+    split = dist.split_baselines([1, 2, 7, 8, 9], 10, n_dev=4)
+    assert (split.block, split.width) == (3, 2)
+    assert [m.tolist() for m in split.members] == [[0, 1], [], [2, 3], [4]]
+    np.testing.assert_array_equal(
+        split.positions, [[1, 2], [3, 3], [1, 2], [0, 3]]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +150,7 @@ _MULTI_DEVICE_SCRIPT = textwrap.dedent(
     jax.config.update("jax_enable_x64", True)  # keep f64 host arrays exact on device
 
     import jax.numpy as jnp
+    from types import SimpleNamespace
     from jax.sharding import PartitionSpec as P
 
     from tabascal import distributed as dist
@@ -145,69 +158,64 @@ _MULTI_DEVICE_SCRIPT = textwrap.dedent(
     assert jax.device_count() == 4
     assert dist.sharding_enabled()
 
-    # padding: up to the next multiple of the device count
-    assert dist.padded_rfi_count(3) == 4
-    assert dist.padded_rfi_count(4) == 4
-    assert dist.padded_rfi_count(5) == 8
+    # divisibility: only an even split shards the visibility-shaped arrays
+    assert dist.baselines_divide(8) and not dist.baselines_divide(10)
 
-    # shard_pytree: rfi-axis leaves split, others replicated, values preserved
-    n_rfi = 4
+    # shard_pytree: per-baseline leaves split, device rows split, others replicated
     rng = np.random.default_rng(0)
     tree = {
-        "rfi_k_r_base": rng.normal(size=(n_rfi, 2, 3)),
-        "_c/ComplexRFIVarAntFine/mu_rfi_k": rng.normal(size=(n_rfi, 2, 3)),
-        "_c/ConstGains/amp_basis": rng.normal(size=(4, 3)),  # name-excluded
-        "ast_k_r_base": rng.normal(size=(6, 3)),
+        "vis_rfi": rng.normal(size=(8, 2, 3)),
+        "ast_k_r_base": rng.normal(size=(8, 3)),
+        "_c/RiemannVisFine/dev_a1": np.arange(12, dtype=np.int32).reshape(4, 3),
+        "rfi_A": rng.normal(size=(8, 2)),            # not a baseline name
+        "vis_obs": rng.normal(size=(5, 2)),          # wrong leading dim
+        "_c/ConstGains/amp_basis": rng.normal(size=(4, 3)),
     }
-    sharded = dist.shard_pytree(tree, n_rfi)
+    sharded = dist.shard_pytree(tree, 8)
     for key, val in tree.items():
         np.testing.assert_array_equal(np.asarray(sharded[key]), val)
-    assert sharded["rfi_k_r_base"].sharding.spec == P("rfi")
-    assert sharded["_c/ComplexRFIVarAntFine/mu_rfi_k"].sharding.spec == P("rfi")
-    assert sharded["_c/ConstGains/amp_basis"].sharding.spec == P()
-    assert sharded["ast_k_r_base"].sharding.spec == P()
+    assert sharded["vis_rfi"].sharding.spec == P("bl")
+    assert sharded["ast_k_r_base"].sharding.spec == P("bl")
+    assert sharded["_c/RiemannVisFine/dev_a1"].sharding.spec == P("bl")
+    for key in ("rfi_A", "vis_obs", "_c/ConstGains/amp_basis"):
+        assert sharded[key].sharding.spec == P(), key
 
-    # pre-sharded leaves pass through untouched
-    again = dist.shard_pytree(sharded, n_rfi)
-    assert again["rfi_k_r_base"] is sharded["rfi_k_r_base"]
+    # an indivisible baseline count leaves the visibilities whole
+    whole = dist.shard_pytree({"vis_rfi": rng.normal(size=(10, 2))}, 10)
+    assert whole["vis_rfi"].sharding.spec == P()
 
-    # sharded_rfi_zeros: correct global shape/value, one shard per device
-    z = dist.sharded_rfi_zeros((n_rfi, 5), complex)
-    assert z.shape == (n_rfi, 5)
-    assert z.sharding.spec == P("rfi")
+    # pre-placed leaves pass through untouched
+    again = dist.shard_pytree(sharded, 8)
+    assert again["vis_rfi"] is sharded["vis_rfi"]
+
+    # replicated_zeros: correct global shape/value, whole on every device
+    z = dist.replicated_zeros((3, 5), complex)
+    assert z.sharding.spec == P()
     np.testing.assert_array_equal(np.asarray(z), 0)
-    assert all(s.data.shape == (1, 5) for s in z.addressable_shards)
+    assert all(s.data.shape == (3, 5) for s in z.addressable_shards)
 
-    # psum_over_rfi: matches the unsharded computation exactly
-    A = rng.normal(size=(n_rfi, 3, 6))
-    Ph = rng.normal(size=(n_rfi, 3, 6))
-
-    def local_vis(a, p):
-        # toy per-source contribution with the source axis summed locally
-        return jnp.sum(a * jnp.exp(1.0j * p), axis=0)
-
-    expect = np.asarray(local_vis(jnp.asarray(A), jnp.asarray(Ph)))
-    A_s = dist.make_global(A, dist.rfi_sharding())
-    Ph_s = dist.make_global(Ph, dist.rfi_sharding())
-    got = dist.psum_over_rfi(local_vis)(A_s, Ph_s)
-    assert got.sharding.spec == P()
-    np.testing.assert_allclose(np.asarray(got), expect, rtol=1e-12)
-
-    # ... and under jit + grad the result and gradient shardings hold
-    def loss(a):
-        return jnp.abs(dist.psum_over_rfi(local_vis)(a, Ph_s)).sum()
-
-    g = jax.jit(jax.grad(loss))(A_s)
-    assert g.shape == A.shape
-    assert g.sharding.spec == P("rfi")
-
-    # constrain_rfi_state inside jit keeps the rfi sharding
+    # constrain_baseline_state / constrain_baseline_axis inside jit
     def f(state):
-        state = {"rfi_A": state["rfi_A"] * 2.0}
-        return dist.constrain_rfi_state(state, n_rfi)
+        state = {"vis_rfi": state["vis_rfi"] * 2.0}
+        return dist.constrain_baseline_state(state, 8)
 
-    out = jax.jit(f)({"rfi_A": A_s})
-    assert out["rfi_A"].sharding.spec == P("rfi")
+    out = jax.jit(f)({"vis_rfi": dist.make_global(tree["vis_rfi"], dist.replicated_sharding())})
+    assert out["vis_rfi"].sharding.spec == P("bl")
+    x = jax.jit(lambda v: dist.constrain_baseline_axis(jnp.stack([v, v]), 1))(sharded["vis_rfi"])
+    assert x.sharding.spec == P(None, "bl")
+
+    # map_over_baselines: each device its own rows, the replicated input's
+    # gradient summed over every device's share
+    rows = dist.make_global(np.arange(8).reshape(4, 2), dist.baseline_sharding())
+    w = jnp.arange(8.0)
+
+    def local(r, w):
+        return w[r[0]] ** 2
+
+    mapped = dist.map_over_baselines(local, in_specs=(P("bl"), P()))
+    np.testing.assert_allclose(np.asarray(mapped(rows, w)), np.arange(8.0) ** 2)
+    g = jax.jit(jax.grad(lambda w: mapped(rows, w).sum()))(w)
+    np.testing.assert_allclose(np.asarray(g), 2 * np.arange(8.0))
 
     # A fresh optimiser state is placed as _map_step returns it, and dual_run's
     # second phase only changes a state leaf, so the fit compiles its step once.
@@ -216,61 +224,102 @@ _MULTI_DEVICE_SCRIPT = textwrap.dedent(
     from tabascal import tab_tools
 
     def model(obs_data=None, state=None, constants=None):
-        x = numpyro.sample("rfi_k_r_base", nd.Normal(jnp.zeros((n_rfi, 3)), 1.0))
-        numpyro.sample("obs", nd.Normal(x.sum(0), 1.0), obs=obs_data)
+        x = numpyro.sample("ast_k_r_base", nd.Normal(jnp.zeros((8, 3)), 1.0))
+        numpyro.sample("obs", nd.Normal(x.sum(1), 1.0), obs=obs_data)
 
-    params = dist.shard_pytree({"rfi_k_r_base": np.ones((n_rfi, 3))}, n_rfi)
-    obs = dist.make_global(np.zeros(3), dist.replicated_sharding())
+    params = dist.shard_pytree({"ast_k_r_base": np.ones((8, 3))}, 8)
+    obs = dist.make_global(np.zeros(8), dist.baseline_sharding())
     tab_tools.run_custom_svi(model, obs, max_iter=2, init_params=params, epsilon=0.1,
                              dual_run=True, state={}, constants={})
     assert tab_tools._map_step._cache_size() == 1
 
-    # Predictions: per-RFI sites stay split (after the sample axis), the rest replicated
-    pred = jax.jit(lambda p: dist.constrain_prediction(p, n_rfi))(
-        {"rfi_A": jnp.ones((1, n_rfi, 2)), "vis_obs": jnp.ones((1, n_rfi, 2))})
-    assert pred["rfi_A"].sharding.spec == P(None, "rfi")
+    # Predictions are gathered whole for the writers
+    pred = jax.jit(dist.constrain_prediction)({"vis_obs": jnp.ones((1, 8, 2))})
     assert pred["vis_obs"].sharding.spec == P()
 
-    # AnalyticVis under an elevation mask: its per-source inputs and mask sharded,
-    # the value and the signal-only gradient match the unsharded run
-    from types import SimpleNamespace
-    from tabascal.components.rfi_vis import AnalyticVis
-
-    cfg = SimpleNamespace(
-        n_ant=3, n_bl=3, n_freq=2, n_time=4, n_int_freq=1, int_time=2.0, chan_width=1e6,
-        freqs=1.4e9 + 1e6 * np.arange(2.0), a1=np.array([0, 0, 1]), a2=np.array([1, 2, 2]),
-        rfi_mask=np.array([[1, 1, 1, 1], [1, 0, 1, 1], [0, 1, 1, 0], [1, 0, 0, 0]], bool),
-        args={"rfi": {"analytic": {"stencil": 1, "segments": 2, "terms": 6,
-                                   "cubic_terms": 3, "scratch_mb": 256}}, "data": {}},
+    # Every RFI visibility component, against its own single-device run: value
+    # and the gradient of every differentiated input. n_ant=5 gives 10
+    # baselines, which do not divide over 4 devices (padded, visibilities
+    # whole); n_ant=8 gives 28, which do (split, no padding).
+    from tabascal.components.rfi_vis import (
+        AnalyticVis, RiemannVisFine, RiemannVisVariableFine,
     )
-    comp = AnalyticVis()
-    comp.setup(cfg)
-    forward = comp.build_forward()
-    shape = (n_rfi, 3, 2, 4)
-    tree = {
-        "rfi_A": rng.normal(size=shape) + 1j * rng.normal(size=shape),
-        "rfi_phase": rng.uniform(0, 6, shape),
-        "rfi_delay_poly_us": rng.normal(size=(n_rfi, 3, 4, 4)) * [1, 1e-4, 1e-6, 1e-8],
-        **{f"{comp.prefix}/{k}": v for k, v in comp.build_constants().items()},
-    }
 
-    def loss(amp, tree):
-        state = {**tree, "rfi_A": amp, "vis_rfi": jnp.zeros((3, 2, 4), complex)}
-        vis = forward({}, state, tree)["vis_rfi"]
-        return jnp.sum(vis.real * np.arange(24.0).reshape(3, 2, 4) + vis.imag)
+    sharded_enabled = dist.sharding_enabled
 
-    sharded = dist.shard_pytree(tree, n_rfi)
-    for key in ("rfi_A", "rfi_phase", "rfi_delay_poly_us", f"{comp.prefix}/rfi_mask"):
-        assert sharded[key].sharding.spec == P("rfi"), key
-    grad = jax.jit(jax.value_and_grad(loss))
-    jvp = lambda a, t, tree: jax.jvp(lambda a: loss(a, tree), (a,), (t,))
-    jaxpr = str(jax.make_jaxpr(jvp)(sharded["rfi_A"], sharded["rfi_A"], sharded))
-    assert "rfi_analytic_jvp_op" in jaxpr and "rfi_analytic_full_jvp_op" not in jaxpr
-    got = grad(sharded["rfi_A"], sharded)
-    dist.sharding_enabled = lambda: False
-    expect = jax.value_and_grad(loss)(tree["rfi_A"], tree)
-    np.testing.assert_allclose(got[0], expect[0], rtol=1e-10)
-    np.testing.assert_allclose(np.asarray(got[1]), expect[1], rtol=1e-10, atol=1e-12)
+    def evaluate(comp_cls, cfg, tree, grad_keys, sharded):
+        dist.sharding_enabled = sharded_enabled if sharded else (lambda: False)
+        try:
+            comp = comp_cls()
+            comp.setup(cfg)
+            forward = comp.build_forward()
+            tree = {**tree, **{f"{comp.prefix}/{k}": v for k, v in comp.build_constants().items()}}
+            if sharded:
+                tree = dist.shard_pytree(tree, cfg.n_bl)
+            weights = np.arange(cfg.n_bl * cfg.n_freq * cfg.n_time, dtype=float).reshape(
+                cfg.n_bl, cfg.n_freq, cfg.n_time
+            )
+
+            def loss(diff, tree):
+                state = {**tree, **diff, "vis_rfi": jnp.zeros((cfg.n_bl, cfg.n_freq, cfg.n_time), complex)}
+                vis = forward({}, state, tree)["vis_rfi"]
+                return jnp.sum(vis.real * weights + vis.imag)
+
+            diff = {k: tree[k] for k in grad_keys}
+            return jax.jit(jax.value_and_grad(loss))(diff, tree)
+        finally:
+            dist.sharding_enabled = sharded_enabled
+
+    def check(comp_cls, cfg, tree, grad_keys, label):
+        got = evaluate(comp_cls, cfg, tree, grad_keys, True)
+        expect = evaluate(comp_cls, cfg, tree, grad_keys, False)
+        np.testing.assert_allclose(got[0], expect[0], rtol=1e-10, err_msg=label)
+        for key in grad_keys:
+            np.testing.assert_allclose(
+                np.asarray(got[1][key]), np.asarray(expect[1][key]),
+                rtol=1e-10, atol=1e-12, err_msg=f"{label}: d/d{key}",
+            )
+
+    n_rfi, n_freq, n_time, n_int_freq, n_int_time = 2, 2, 3, 2, 4
+    for n_ant in (5, 8):
+        a1, a2 = (np.asarray(x, dtype=np.int32) for x in np.triu_indices(n_ant, 1))
+        n_bl = len(a1)
+        base = dict(n_ant=n_ant, n_bl=n_bl, n_freq=n_freq, n_time=n_time, n_rfi=n_rfi,
+                    n_int_freq=n_int_freq, n_int_time=n_int_time, a1=a1, a2=a2)
+        fine = (n_rfi, n_ant, n_freq * n_int_freq, n_time * n_int_time)
+        fine_tree = {
+            "rfi_A": rng.normal(size=fine) + 1j * rng.normal(size=fine),
+            "rfi_phase": rng.uniform(0, 6, fine),
+        }
+        # Two stride groups, interleaved over the axis, so every device's share
+        # of each differs and some are padded.
+        groups = [np.arange(0, n_bl, 2), np.arange(1, n_bl, 2)]
+        for backend in ("ffi", "jax"):
+            rfi = {"backend": backend, "baseline_block_size": 3}
+            cfg = SimpleNamespace(**base, args={"rfi": rfi})
+            check(RiemannVisFine, cfg, fine_tree, ("rfi_A", "rfi_phase"),
+                  f"RiemannVisFine {backend} n_ant={n_ant}")
+            cfg = SimpleNamespace(**base, args={"rfi": rfi},
+                                  time_sample_idxs=groups, time_strides=[1, 2])
+            check(RiemannVisVariableFine, cfg, fine_tree, ("rfi_A", "rfi_phase"),
+                  f"RiemannVisVariableFine {backend} n_ant={n_ant}")
+
+        # AnalyticVis under an elevation mask, with its distinct-pair padding
+        mask = rng.uniform(size=(n_rfi, n_time)) > 0.3
+        cfg = SimpleNamespace(
+            **base, int_time=2.0, chan_width=1e6, freqs=1.4e9 + 1e6 * np.arange(n_freq),
+            rfi_mask=mask,
+            args={"rfi": {"analytic": {"stencil": 1, "segments": 2, "terms": 6,
+                                       "cubic_terms": 3, "scratch_mb": 256}}, "data": {}},
+        )
+        shape = (n_rfi, n_ant, n_freq, n_time)
+        tree = {
+            "rfi_A": rng.normal(size=shape) + 1j * rng.normal(size=shape),
+            "rfi_phase": rng.uniform(0, 6, shape),
+            "rfi_delay_poly_us": rng.normal(size=(n_rfi, n_ant, n_time, 4)) * [1, 1e-4, 1e-6, 1e-8],
+        }
+        check(AnalyticVis, cfg, tree, ("rfi_A", "rfi_phase", "rfi_delay_poly_us"),
+              f"AnalyticVis n_ant={n_ant}")
 
     print("MULTI_DEVICE_OK")
     """

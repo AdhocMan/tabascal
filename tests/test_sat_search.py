@@ -841,7 +841,7 @@ def stub_orbits(monkeypatch, records):
         asked.update(kwargs)
         ids = [int(n) for n in norad_ids]
 
-        return None, None, ids, [by_id[n] for n in ids], len(ids)
+        return None, None, ids, [by_id[n] for n in ids]
 
     monkeypatch.setattr(mod, "fetch_orbital_elements", _fetch)
 

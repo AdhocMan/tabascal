@@ -1,14 +1,7 @@
 """Tests for tabascal.components.rfi_signal — the GP RFI-signal components.
 
-The central contract here is the device-sharding one: the RFI axis is padded up to a
-multiple of the device count with duplicate "dark dummy" satellites, and those dummies
-must contribute exactly zero amplitude and exactly zero gradient. That is enforced by
-``BaseGPRFI.masked_forward_transform`` inside every component's forward, so it holds for
-arbitrary parameters — not just the init values. ``TestDummySourcesStayDark`` pins it down.
-
-Padding needs no extra devices: it is driven purely by ``n_rfi_real < n_rfi`` on the
-config, and the mask is device-independent. Only ``test_multi_device_padded_sources_dark``
-spends a subprocess on the real sharded placeholders.
+Only ``test_multi_device_placeholder_is_replicated`` spends a subprocess on a real
+device mesh: under baseline sharding every device holds the whole source axis.
 """
 
 import functools
@@ -48,7 +41,7 @@ from ..test_ms import _keywords, run_reader  # noqa: F401 -- run_reader is a fix
 # Helpers
 # ---------------------------------------------------------------------------
 
-N_RFI, N_RFI_REAL, N_ANT, N_FREQ, N_TIME = 4, 3, 3, 4, 8
+N_RFI, N_ANT, N_FREQ, N_TIME = 3, 3, 4, 8
 
 # Arbitrary but fixed epoch for the mock observation's absolute time grid.
 _TEST_EPOCH_JD = 2460000.5
@@ -62,21 +55,13 @@ FOURIER_CLASSES = [ComplexRFIVarAntFine, ComplexRFIConstAntFine]
 COMMON_INITS = ["prior", "zeros", "ones", "sample"]
 
 
-def _norad_ids(n_rfi, n_rfi_real):
-    """NORAD ids laid out as TabConfig builds them: real sources, then padding.
-
-    Device sharding pads the satellite list to a multiple of the device count by
-    repeating the *last real* satellite, so the tail entries are duplicates of it --
-    which is exactly why consumers that look ids up in an external file must slice to
-    ``[:n_rfi_real]`` rather than trust the full list to be unique.
-    """
-    ids = [40000 + i for i in range(n_rfi_real)]
-    return ids + [ids[-1]] * (n_rfi - n_rfi_real)
+def _norad_ids(n_rfi):
+    """NORAD ids for ``n_rfi`` distinct satellites."""
+    return [40000 + i for i in range(n_rfi)]
 
 
 def make_rfi_config(
     n_rfi=N_RFI,
-    n_rfi_real=N_RFI_REAL,
     n_ant=N_ANT,
     n_freq=N_FREQ,
     n_time=N_TIME,
@@ -89,7 +74,6 @@ def make_rfi_config(
     corr_freq=5e6,
     corr_time=60.0,
     pad_factor=2,
-    with_n_rfi_real=True,
     rfi_mask_fine=None,
     time_scale="utc",
     signal_type=None,
@@ -111,7 +95,7 @@ def make_rfi_config(
     n_bl = n_ant * (n_ant - 1) // 2
 
     config = SimpleNamespace(
-        norad_ids=_norad_ids(n_rfi, n_rfi_real),
+        norad_ids=_norad_ids(n_rfi),
         rfi_mask_fine=rfi_mask_fine,
         n_rfi=n_rfi,
         n_ant=n_ant,
@@ -157,11 +141,6 @@ def make_rfi_config(
     if signal_type is not None:
         config.args["rfi"]["signal_type"] = signal_type
 
-    # Omitted entirely (rather than set to None) so the getattr fallback in
-    # BaseGPRFI.setup is exercised as it would be on an unpadded TabConfig.
-    if with_n_rfi_real:
-        config.n_rfi_real = n_rfi_real
-
     return config
 
 
@@ -175,8 +154,8 @@ def setup_component(cls, **kwargs):
 def random_params(comp, seed=0):
     """Random values shaped like the component's base parameters.
 
-    Deliberately *not* the init values: the darkness guarantee has to hold for whatever
-    the optimiser wanders into, not just the starting point.
+    Deliberately *not* the init values: a property of the forward has to hold for
+    whatever the optimiser wanders into, not just the starting point.
     """
     names = sorted(comp.init_params_base)
     keys = jax.random.split(jax.random.PRNGKey(seed), len(names))
@@ -194,7 +173,7 @@ def run_forward(comp, params=None, state=None):
     return forward(params, {} if state is None else state, make_constants(comp))["rfi_A"]
 
 
-def make_est_file(tmp_path, n_rfi_real=N_RFI_REAL, n_time=N_TIME, n_freq=N_FREQ):
+def make_est_file(tmp_path, n_rfi=N_RFI, n_time=N_TIME, n_freq=N_FREQ):
     """Write the light-curve .npz that the `est` prior/init modes read.
 
     Covers the mock observation's own time and frequency span, so the
@@ -208,8 +187,8 @@ def make_est_file(tmp_path, n_rfi_real=N_RFI_REAL, n_time=N_TIME, n_freq=N_FREQ)
     times = np.linspace(0.0, 120.0, N_TIME, dtype=np.float64)
     np.savez(
         path,
-        light_curves=np.abs(rng.randn(n_rfi_real, n_time, n_freq)),
-        norad_ids=np.array(_norad_ids(n_rfi_real, n_rfi_real)),
+        light_curves=np.abs(rng.randn(n_rfi, n_time, n_freq)),
+        norad_ids=np.array(_norad_ids(n_rfi)),
         times=_TEST_EPOCH_MJD + times / 86400.0,
         freqs=np.linspace(1.4e9, 1.41e9, n_freq, dtype=np.float64),
         time_scale="utc",
@@ -364,67 +343,6 @@ class TestRfiSignalConfigValidation:
 
 
 # ---------------------------------------------------------------------------
-# BaseGPRFI padding helpers
-# ---------------------------------------------------------------------------
-
-class TestPaddingHelpers:
-    """The device-sharding helpers on BaseGPRFI, driven through a concrete subclass."""
-
-    def test_mask_dummy_rfi_zeroes_only_padded_rows(self):
-        comp = setup_component(ComplexRFIVarAntFine)
-        arr = jnp.arange(N_RFI * 2 * 3, dtype=float).reshape(N_RFI, 2, 3) + 1.0
-
-        masked = comp._mask_dummy_rfi(arr)
-
-        assert jnp.array_equal(masked[:N_RFI_REAL], arr[:N_RFI_REAL])
-        assert jnp.all(masked[N_RFI_REAL:] == 0)
-
-    def test_mask_dummy_rfi_is_noop_when_unpadded(self):
-        comp = setup_component(ComplexRFIVarAntFine, n_rfi=N_RFI, n_rfi_real=N_RFI)
-        arr = jnp.ones((N_RFI, 2, 3))
-
-        assert jnp.array_equal(comp._mask_dummy_rfi(arr), arr)
-
-    @pytest.mark.parametrize("dtype", [float, complex])
-    def test_zero_pad_rfi_grows_and_zeroes(self, dtype):
-        """A truth/estimate array with only the real sources is padded with exact zeros."""
-        comp = setup_component(ComplexRFIVarAntFine)
-        arr = jnp.ones((N_RFI_REAL, 2, 3), dtype=dtype)
-
-        padded = comp._zero_pad_rfi(arr)
-
-        assert padded.shape == (N_RFI, 2, 3)
-        assert padded.dtype == arr.dtype
-        assert jnp.array_equal(padded[:N_RFI_REAL], arr)
-        assert jnp.all(padded[N_RFI_REAL:] == 0)
-
-    def test_zero_pad_rfi_is_identity_when_already_full(self):
-        comp = setup_component(ComplexRFIVarAntFine)
-        arr = jnp.ones((N_RFI, 2, 3))
-
-        assert comp._zero_pad_rfi(arr) is arr
-
-    def test_n_rfi_real_defaults_to_n_rfi_when_config_lacks_it(self):
-        """An unpadded TabConfig has no n_rfi_real; the mask must then be a no-op."""
-        comp = setup_component(ComplexRFIVarAntFine, with_n_rfi_real=False)
-
-        assert comp.n_rfi_real == comp.n_rfi
-        arr = jnp.ones((N_RFI, 2, 3))
-        assert jnp.array_equal(comp._mask_dummy_rfi(arr), arr)
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    def test_masked_forward_transform_equals_mask_of_forward(self, cls):
-        comp = setup_component(cls)
-        scale, mu = transform_args(comp)
-        base = jnp.ones(comp.init_params_base[sorted(comp.init_params_base)[0]].shape)
-
-        assert jnp.allclose(
-            comp.masked_forward_transform(base, scale, mu),
-            comp._mask_dummy_rfi(comp.forward_transform(base, scale, mu)),
-        )
-
-
-# ---------------------------------------------------------------------------
 # Shared component contract
 # ---------------------------------------------------------------------------
 
@@ -552,98 +470,6 @@ class TestComponentContract:
 # The padding contract
 # ---------------------------------------------------------------------------
 
-class TestDummySourcesStayDark:
-    """Padded dummy satellites must carry zero amplitude and zero gradient.
-
-    These are the assertions that stop a future refactor from quietly undoing the
-    masking in ``masked_forward_transform``.
-    """
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    @pytest.mark.parametrize("init", COMMON_INITS)
-    def test_forward_is_dark_for_arbitrary_params(self, cls, init):
-        """rfi_A is exactly zero on the padded rows, whatever the parameters are."""
-        comp = setup_component(cls, init=init)
-        rfi_A = run_forward(comp, random_params(comp))
-
-        assert jnp.all(rfi_A[N_RFI_REAL:] == 0)
-        # ...and the real sources are not accidentally zeroed too.
-        assert jnp.max(jnp.abs(rfi_A[:N_RFI_REAL])) > 0
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    @pytest.mark.parametrize("mean", ["zeros", "data"])
-    def test_forward_is_dark_for_every_prior_mean(self, cls, mean):
-        """A non-zero prior mean on the padded rows must still produce a dark output."""
-        comp = setup_component(cls, mean=mean)
-        rfi_A = run_forward(comp, random_params(comp))
-
-        assert jnp.all(rfi_A[N_RFI_REAL:] == 0)
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    def test_gradient_vanishes_on_padded_rows(self, cls):
-        """Dummy sources receive exactly zero gradient, so the optimiser cannot light them."""
-        comp = setup_component(cls, init="sample")
-        constants = make_constants(comp)
-        forward = comp.build_forward()
-
-        def loss(params):
-            return jnp.sum(jnp.abs(forward(params, {}, constants)["rfi_A"]) ** 2)
-
-        grads = jax.grad(loss)(random_params(comp))
-
-        for name, grad in grads.items():
-            assert jnp.all(grad[N_RFI_REAL:] == 0), f"{name} has gradient on padded rows"
-            assert jnp.max(jnp.abs(grad[:N_RFI_REAL])) > 0, f"{name} has no real gradient"
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    def test_padding_does_not_change_the_real_sources(self, cls):
-        """Adding dark dummies leaves the real sources' visibility contribution alone.
-
-        The unit-level analogue of test_pipeline_sharded_equivalence.
-        """
-        padded = setup_component(cls, n_rfi=N_RFI, n_rfi_real=N_RFI_REAL, init="sample")
-        unpadded = setup_component(cls, n_rfi=N_RFI_REAL, n_rfi_real=N_RFI_REAL, init="sample")
-
-        # Same parameters for the real sources; the padded run gets zeros for the dummies.
-        shared = random_params(unpadded)
-        padded_params = {
-            name: jnp.concatenate(
-                [value, jnp.zeros((N_RFI - N_RFI_REAL,) + value.shape[1:], value.dtype)]
-            )
-            for name, value in shared.items()
-        }
-
-        padded_out = run_forward(padded, padded_params)
-        unpadded_out = run_forward(unpadded, shared)
-
-        assert jnp.allclose(padded_out[:N_RFI_REAL], unpadded_out, atol=tol())
-
-    @pytest.mark.parametrize("cls", FOURIER_CLASSES)
-    @pytest.mark.parametrize("mode", ["init", "mean"])
-    def test_estimate_file_is_zero_padded(self, cls, mode, tmp_path):
-        """_read_estimate loads only the real sources and zero-pads to the sharded count."""
-        est = make_est_file(tmp_path)
-        kwargs = {"est": est}
-        kwargs["init" if mode == "init" else "mean"] = "est"
-        comp = setup_component(cls, **kwargs)
-
-        latent = getattr(comp, latent_attr(comp)) if mode == "init" else comp.mu_rfi_k
-
-        assert latent.shape[0] == N_RFI
-        assert jnp.all(latent[N_RFI_REAL:] == 0)
-        assert jnp.max(jnp.abs(latent[:N_RFI_REAL])) > 0
-
-    def test_data_estimate_splits_over_real_sources_only(self):
-        """The data-derived prior mean divides by n_rfi_real, not the padded n_rfi."""
-        padded = setup_component(ComplexRFIVarAntFine, n_rfi=N_RFI, n_rfi_real=N_RFI_REAL, mean="data")
-        unpadded = setup_component(
-            ComplexRFIVarAntFine, n_rfi=N_RFI_REAL, n_rfi_real=N_RFI_REAL, mean="data"
-        )
-
-        # Same per-source share regardless of how many dummies were appended.
-        assert jnp.allclose(padded.mu_rfi_k[:N_RFI_REAL], unpadded.mu_rfi_k, atol=tol())
-
-
 # ---------------------------------------------------------------------------
 # Elevation mask
 # ---------------------------------------------------------------------------
@@ -663,25 +489,25 @@ class TestMatchedFilterSeeding:
     """
 
     @staticmethod
-    def _estimate(n_rfi_real=N_RFI_REAL, n_freq=N_FREQ, n_time=N_TIME):
+    def _estimate(n_rfi=N_RFI, n_freq=N_FREQ, n_time=N_TIME):
         """A light-curve result from the real estimator, not a hand-written dict."""
         from tabascal.rfi_estimate import _lc_result, matched_filter_light_curves
 
         rng = np.random.RandomState(0)
         n_ant = 4
         a1, a2 = np.triu_indices(n_ant, 1)
-        phase = rng.uniform(-np.pi, np.pi, (n_rfi_real, n_ant, n_freq, n_time))
+        phase = rng.uniform(-np.pi, np.pi, (n_rfi, n_ant, n_freq, n_time))
         E = np.exp(1j * phase)
-        curves = np.abs(rng.randn(n_rfi_real, n_freq, n_time)) + 0.5
+        curves = np.abs(rng.randn(n_rfi, n_freq, n_time)) + 0.5
         vis = sum(
-            (E[s][a1] * np.conj(E[s][a2])) * curves[s] for s in range(n_rfi_real)
+            (E[s][a1] * np.conj(E[s][a2])) * curves[s] for s in range(n_rfi)
         )
         lc, err = matched_filter_light_curves(vis, phase, a1, a2)
 
         return _lc_result(
             lc,
             err,
-            _norad_ids(n_rfi_real, n_rfi_real),
+            _norad_ids(n_rfi),
             np.linspace(1.4e9, 1.41e9, n_freq, dtype=np.float64),
             _TEST_EPOCH_MJD + np.linspace(0.0, 120.0, n_time, dtype=np.float64) / 86400.0,
             "DATA",
@@ -739,19 +565,6 @@ class TestMatchedFilterSeeding:
         np.testing.assert_array_equal(
             np.asarray(aliased.init_rfi_k), np.asarray(long_form.init_rfi_k)
         )
-
-    @pytest.mark.parametrize("cls", FOURIER_CLASSES)
-    @pytest.mark.parametrize("mode", ["init", "mean"])
-    def test_the_padded_sources_stay_dark(self, cls, mode, estimate):
-        """The estimator only knows the real satellites; the dummies stay at zero."""
-        key = "init" if mode == "init" else "mean"
-        comp = setup_component(cls, **{key: "matched-filter"})
-
-        latent = getattr(comp, latent_attr(comp)) if mode == "init" else comp.mu_rfi_k
-
-        assert latent.shape[0] == N_RFI
-        assert jnp.all(latent[N_RFI_REAL:] == 0)
-        assert jnp.max(jnp.abs(latent[:N_RFI_REAL])) > 0
 
     def test_the_antenna_axis_follows_the_model(self, estimate):
         """VarAnt carries one amplitude per antenna; ConstAnt shares one."""
@@ -832,7 +645,7 @@ class TestElevationMask:
 
         assert jnp.allclose(got[0, :, :, : N_TIME // 2], want[0, :, :, : N_TIME // 2])
         # Sources that never drop below the cut are unaffected everywhere.
-        assert jnp.allclose(got[1:N_RFI_REAL], want[1:N_RFI_REAL])
+        assert jnp.allclose(got[1:N_RFI], want[1:N_RFI])
 
     @pytest.mark.parametrize("cls", ALL_CLASSES)
     def test_no_mask_leaves_the_forward_unchanged(self, cls):
@@ -841,17 +654,6 @@ class TestElevationMask:
 
         assert comp.rfi_mask_fine is None
         assert "rfi_mask_fine" not in comp.build_constants()
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    def test_mask_composes_with_dummy_padding(self, cls):
-        """Both masks apply: padded rows stay dark and the masked source still cuts."""
-        comp = setup_component(cls, rfi_mask_fine=elevation_mask())
-        rfi_A = run_forward(comp, random_params(comp))
-
-        assert jnp.all(rfi_A[N_RFI_REAL:] == 0), "padded dummy sources are not dark"
-        assert jnp.max(jnp.abs(rfi_A[0, :, :, N_TIME // 2:])) == 0.0
-        # The masking must not have swallowed the signal wholesale.
-        assert jnp.max(jnp.abs(rfi_A[:N_RFI_REAL])) > 0
 
     @pytest.mark.parametrize("cls", ALL_CLASSES)
     def test_mask_is_expanded_over_integrations(self, cls):
@@ -905,7 +707,7 @@ class TestFourierScanTransform:
     def _vmap_reference(comp, params):
         """rfi_A computed the way the pre-scan implementation did."""
         rfi_k_A_base = params["rfi_k_r_base"] + 1.0j * params["rfi_k_i_base"]
-        rfi_k_A = comp.masked_forward_transform(
+        rfi_k_A = comp.forward_transform(
             rfi_k_A_base, comp.sigma_rfi_k, comp.mu_rfi_k
         )
         return vmap(
@@ -987,7 +789,7 @@ class TestClassSpecifics:
         comp = setup_component(ComplexRFIVarAntFine, init="sample")
         rfi_A = run_forward(comp, random_params(comp))
 
-        assert not jnp.allclose(rfi_A[:N_RFI_REAL], rfi_A[:N_RFI_REAL, :1])
+        assert not jnp.allclose(rfi_A[:N_RFI], rfi_A[:N_RFI, :1])
 
 
 # ---------------------------------------------------------------------------
@@ -1004,13 +806,13 @@ _MULTI_DEVICE_SCRIPT = textwrap.dedent(
 
     assert jax.device_count() == 2, jax.device_count()
 
-    n_rfi, n_rfi_real, n_ant, n_freq, n_time = 4, 3, 3, 4, 8
+    n_rfi, n_ant, n_freq, n_time = 3, 3, 4, 8
     freqs = jnp.linspace(1.4e9, 1.41e9, n_freq)
     times = jnp.linspace(0.0, 120.0, n_time)
 
     config = SimpleNamespace(
-        norad_ids=[40000, 40001, 40002, 40002],
-        n_rfi=n_rfi, n_rfi_real=n_rfi_real, n_ant=n_ant, n_freq=n_freq, n_time=n_time,
+        norad_ids=[40000, 40001, 40002],
+        n_rfi=n_rfi, n_ant=n_ant, n_freq=n_freq, n_time=n_time,
         n_freq_fine=n_freq, n_time_fine=n_time, n_int_freq=1, n_int_time=1,
         freqs=freqs, freqs_fine=freqs, chan_width=float(freqs[1] - freqs[0]),
         times=times, times_fine=times, int_time=float(times[1] - times[0]),
@@ -1030,10 +832,11 @@ _MULTI_DEVICE_SCRIPT = textwrap.dedent(
     comp = ComplexRFIVarAntFine()
     comp.setup(config)
 
-    # The placeholder is allocated per-shard, never as a full single-device array.
+    # Every device holds the whole source axis, placed there directly.
     placeholder = comp.state_outputs["rfi_A"]
     assert placeholder.shape == (n_rfi, n_ant, n_freq, n_time), placeholder.shape
     assert len(placeholder.sharding.device_set) == 2, placeholder.sharding
+    assert placeholder.sharding.is_fully_replicated, placeholder.sharding
 
     constants = {f"{comp.prefix}/{k}": v for k, v in comp.build_constants().items()}
     keys = jax.random.split(jax.random.PRNGKey(0), len(comp.init_params_base))
@@ -1043,16 +846,15 @@ _MULTI_DEVICE_SCRIPT = textwrap.dedent(
     }
 
     rfi_A = comp.build_forward()(params, {}, constants)["rfi_A"]
-    assert jnp.all(rfi_A[n_rfi_real:] == 0), "padded sources are not dark"
-    assert jnp.max(jnp.abs(rfi_A[:n_rfi_real])) > 0, "real sources are dark"
+    assert jnp.all(jnp.max(jnp.abs(rfi_A), axis=(1, 2, 3)) > 0), "a source is dark"
 
     print("MULTI_DEVICE_OK")
     """
 )
 
 
-def test_multi_device_padded_sources_dark():
-    """Padded sources stay dark with the RFI axis genuinely split across devices."""
+def test_multi_device_placeholder_is_replicated():
+    """Under baseline sharding the rfi_A placeholder is whole on every device."""
     env = {
         **os.environ,
         "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
@@ -1758,7 +1560,7 @@ class TestTheEstimateIsSampledOnUtc:
     def _sample(comp, path, times_mjd):
         """The one satellite's light curve, read onto ``times_mjd``."""
 
-        ids = comp.norad_ids[: comp.n_rfi_real]
+        ids = comp.norad_ids
 
         return np.asarray(read_light_curves(path, ids, times_mjd, comp.freqs))[0, 0]
 
@@ -1776,7 +1578,7 @@ class TestTheEstimateIsSampledOnUtc:
         comp, config = self._component(data)
         path = self._spike_file(
             tmp_path,
-            comp.norad_ids[: comp.n_rfi_real],
+            comp.norad_ids,
             self._peak_mjd_utc(-self.LEAP_SECS),
         )
 
@@ -1817,7 +1619,7 @@ class TestTheEstimateIsSampledOnUtc:
         data = run_reader(self._ms_times(), keywords=_keywords("UTC"))
         comp, config = self._component(data)
         path = self._spike_file(
-            tmp_path, comp.norad_ids[: comp.n_rfi_real], self._peak_mjd_utc(0.0)
+            tmp_path, comp.norad_ids, self._peak_mjd_utc(0.0)
         )
 
         np.testing.assert_array_equal(comp.est_times_mjd, config.times_mjd)
@@ -1831,7 +1633,7 @@ class TestTheEstimateIsSampledOnUtc:
         data = run_reader(self._ms_times(), keywords=_keywords("UTC"))
         comp, _ = self._component(data)
         path = self._spike_file(
-            tmp_path, comp.norad_ids[: comp.n_rfi_real], self._peak_mjd_utc(0.0)
+            tmp_path, comp.norad_ids, self._peak_mjd_utc(0.0)
         )
 
         curve = self._sample(comp, path, comp.est_times_mjd)
@@ -1890,7 +1692,6 @@ def setup_with_gp_cov(cls, gp_cov, n_freq=8, n_time=16, **kwargs):
     this helper is the one place that has to know they sit at different levels.
     """
     kwargs.setdefault("n_rfi", 2)
-    kwargs.setdefault("n_rfi_real", 2)
     kwargs.setdefault("n_ant", 3)
     config = make_rfi_config(n_freq=n_freq, n_time=n_time, **kwargs)
     if gp_cov is not _ABSENT:
@@ -2174,7 +1975,7 @@ class TestTheStdIsTheWidthItClaims:
     SEEDS = range(24)
 
     @classmethod
-    def _rms_vis(cls, comp, n_rfi_real=1, seeds=None):
+    def _rms_vis(cls, comp, seeds=None):
         """``rms|V|`` of the visibility the component's own forward pass builds.
 
         Through ``build_forward``, not through a re-derivation of it: the
@@ -2198,8 +1999,8 @@ class TestTheStdIsTheWidthItClaims:
             n_ant = rfi_A.shape[1]
             a1, a2 = np.triu_indices(n_ant, k=1)
             vis = calculate_rfi_vis_fine(
-                rfi_A[:n_rfi_real],
-                jnp.zeros_like(rfi_A[:n_rfi_real], dtype=float),
+                rfi_A,
+                jnp.zeros_like(rfi_A, dtype=float),
                 jnp.asarray(a1),
                 jnp.asarray(a2),
             )
@@ -2225,7 +2026,7 @@ class TestTheStdIsTheWidthItClaims:
         normalisation, and it tightens with draws rather than converging on
         something else -- at 800 it is inside 4 %.
         """
-        comp = setup_component(ComplexRFIVarAntFine, std=std, n_rfi=1, n_rfi_real=1)
+        comp = setup_component(ComplexRFIVarAntFine, std=std, n_rfi=1)
 
         assert self._rms_vis(comp) == pytest.approx(std, rel=0.25)
 
@@ -2241,7 +2042,7 @@ class TestTheStdIsTheWidthItClaims:
         separate ``sqrt(2)`` from both 1 (the antenna structures made equal)
         and 2 (the factor applied twice), which is what this has to catch.
         """
-        kwargs = dict(std=3.0, n_rfi=1, n_rfi_real=1)
+        kwargs = dict(std=3.0, n_rfi=1)
         var_ant = self._rms_vis(setup_component(ComplexRFIVarAntFine, **kwargs))
         const_ant = self._rms_vis(setup_component(ComplexRFIConstAntFine, **kwargs))
 
@@ -2260,13 +2061,12 @@ class TestTheStdIsTheWidthItClaims:
         much the geometric phases happen to align.
         """
         one = self._rms_vis(
-            setup_component(ComplexRFIVarAntFine, std=3.0, n_rfi=1, n_rfi_real=1)
+            setup_component(ComplexRFIVarAntFine, std=3.0, n_rfi=1)
         )
         many = self._rms_vis(
             setup_component(
-                ComplexRFIVarAntFine, std=3.0, n_rfi=n_sources, n_rfi_real=n_sources
-            ),
-            n_rfi_real=n_sources,
+                ComplexRFIVarAntFine, std=3.0, n_rfi=n_sources
+            )
         )
 
         assert many / one == pytest.approx(np.sqrt(n_sources), rel=0.15)
@@ -2278,8 +2078,8 @@ class TestTheStdIsTheWidthItClaims:
         std is a scale on sigma and the same seeds are drawn either side, so
         this ratio is deterministic where the absolute width is sampled.
         """
-        base = self._rms_vis(setup_component(cls, std=2.0, n_rfi=1, n_rfi_real=1))
-        doubled = self._rms_vis(setup_component(cls, std=4.0, n_rfi=1, n_rfi_real=1))
+        base = self._rms_vis(setup_component(cls, std=2.0, n_rfi=1))
+        doubled = self._rms_vis(setup_component(cls, std=4.0, n_rfi=1))
         assert doubled / base == pytest.approx(2.0, rel=0.02)
 
     @pytest.mark.parametrize("cls", FOURIER_CLASSES)
@@ -2437,7 +2237,7 @@ class TestRealSignalType:
     def test_a_ones_init_starts_the_forward_at_one(self, cls):
         comp = setup_component(cls, signal_type="real", init="ones", mean="zeros")
 
-        np.testing.assert_allclose(run_forward(comp)[:N_RFI_REAL], 1.0, atol=10 * tol())
+        np.testing.assert_allclose(run_forward(comp)[:N_RFI], 1.0, atol=10 * tol())
 
     @pytest.mark.parametrize("cls", ALL_CLASSES)
     def test_a_sampled_init_is_the_seeded_real_draw(self, cls):
@@ -2445,7 +2245,7 @@ class TestRealSignalType:
         base = comp.init_params_base["rfi_k_r_base"]
         draw = jax.random.normal(component_key(comp.seed, comp.seed_tag), base.shape)
 
-        np.testing.assert_allclose(base[:N_RFI_REAL], draw[:N_RFI_REAL], atol=10 * tol())
+        np.testing.assert_allclose(base[:N_RFI], draw[:N_RFI], atol=10 * tol())
 
     @pytest.mark.parametrize("cls", ALL_CLASSES)
     @pytest.mark.parametrize("mean", ["zeros", "data"])
@@ -2464,17 +2264,10 @@ class TestRealSignalType:
         # The working precision's complex, which the kernels pair with its float.
         assert rfi_A.dtype == jnp.zeros(1, complex).dtype
         assert jnp.all(rfi_A.imag == 0)
-        assert jnp.max(jnp.abs(rfi_A[:N_RFI_REAL])) > 0
+        assert jnp.max(jnp.abs(rfi_A[:N_RFI])) > 0
 
     @pytest.mark.parametrize("cls", ALL_CLASSES)
-    def test_the_dummy_sources_stay_dark(self, cls):
-        comp = setup_component(cls, signal_type="real")
-        rfi_A = run_forward(comp, random_params(comp))
-
-        assert jnp.all(rfi_A[N_RFI_REAL:] == 0)
-
-    @pytest.mark.parametrize("cls", ALL_CLASSES)
-    def test_the_gradient_reaches_the_real_sources_only(self, cls):
+    def test_the_gradient_reaches_every_source(self, cls):
         comp = setup_component(cls, signal_type="real")
         forward = comp.build_forward()
         constants = make_constants(comp)
@@ -2484,8 +2277,7 @@ class TestRealSignalType:
         )(random_params(comp))["rfi_k_r_base"]
 
         # Each source through its own latent, not one shared across them.
-        assert jnp.all(jnp.max(jnp.abs(grad[:N_RFI_REAL]), axis=(1, 2, 3)) > 0)
-        assert jnp.all(grad[N_RFI_REAL:] == 0)
+        assert jnp.all(jnp.max(jnp.abs(grad), axis=(1, 2, 3)) > 0)
 
     @pytest.mark.parametrize("cls", ALL_CLASSES)
     def test_the_forward_is_jit_compatible(self, cls):
@@ -2530,7 +2322,7 @@ class TestRealSignalType:
         """The key means the same width in either space. Sampled, as for the
         complex space; see :class:`TestTheStdIsTheWidthItClaims`."""
         comp = setup_component(
-            ComplexRFIVarAntFine, std=std, n_rfi=1, n_rfi_real=1, signal_type="real"
+            ComplexRFIVarAntFine, std=std, n_rfi=1, signal_type="real"
         )
 
         assert TestTheStdIsTheWidthItClaims._rms_vis(comp) == pytest.approx(
@@ -2542,7 +2334,7 @@ class TestRealSignalType:
         circular complex one. Bounded for the reason the complex test gives,
         separating ``sqrt(3)`` from 1 and from 3; the fourth moment is heavy
         tailed, so more draws than that test needs."""
-        kwargs = dict(std=3.0, n_rfi=1, n_rfi_real=1, signal_type="real")
+        kwargs = dict(std=3.0, n_rfi=1, signal_type="real")
         rms = functools.partial(TestTheStdIsTheWidthItClaims._rms_vis, seeds=range(200))
         var_ant = rms(setup_component(ComplexRFIVarAntFine, **kwargs))
         const_ant = rms(setup_component(ComplexRFIConstAntFine, **kwargs))
@@ -2563,11 +2355,11 @@ class TestRealSignalType:
         amps = jnp.asarray(amps, dtype=complex)[:, None, None, None]
         monkeypatch.setattr(
             mod, "read_true_rfi_A",
-            lambda *_: jnp.broadcast_to(amps, (N_RFI_REAL, N_ANT, *comp.signal_shape)),
+            lambda *_: jnp.broadcast_to(amps, (N_RFI, N_ANT, *comp.signal_shape)),
         )
 
         comp._compute_true_params("sim.zarr", "DATA")
-        A = vmap(vmap(comp.latent_to_signal))(comp.true_rfi_k_A)[:N_RFI_REAL]
+        A = vmap(vmap(comp.latent_to_signal))(comp.true_rfi_k_A)[:N_RFI]
 
         expected = np.broadcast_to(np.asarray(kept, float)[:, None, None, None], A.shape)
         np.testing.assert_allclose(A, expected, atol=10 * tol())

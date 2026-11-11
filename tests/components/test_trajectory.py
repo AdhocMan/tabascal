@@ -459,25 +459,21 @@ class TestFetchOrbitalElementsNoSatellites:
         resolution = TLEResolution(
             requested=[], obs_epoch_jd=float("nan"), remote_max_age_days=3.0
         )
-        elements, epoch_jd, norad_ids, orbit_records, n_rfi_real = (
+        elements, epoch_jd, norad_ids, orbit_records = (
             fetch_orbital_elements(resolution=resolution)
         )
         assert elements.shape == (0, 6)
         assert epoch_jd.shape == (0,)
         assert norad_ids == []
         assert orbit_records == []
-        assert n_rfi_real == 0
 
     def test_empty_request_without_a_preflight_resolution(self, monkeypatch):
         import pandas as pd
         from tabascal.components import trajectory as traj_mod
 
         monkeypatch.setattr(traj_mod, "get_tles_by_id", lambda *a, **k: pd.DataFrame())
-        _, _, norad_ids, _, n_rfi_real = traj_mod.fetch_orbital_elements(
-            2460000.0, []
-        )
+        _, _, norad_ids, _ = traj_mod.fetch_orbital_elements(2460000.0, [])
         assert norad_ids == []
-        assert n_rfi_real == 0
 
 
 class TestFetchOrbitalElementsPartial:
@@ -511,11 +507,8 @@ class TestFetchOrbitalElementsPartial:
         from tabascal.components.trajectory import fetch_orbital_elements
 
         self._patch_partial(monkeypatch, [25544, 38833])
-        _, _, norad_ids, _, n_rfi_real = fetch_orbital_elements(
-            2460000.0, [25544, 38833]
-        )
+        _, _, norad_ids, _ = fetch_orbital_elements(2460000.0, [25544, 38833])
         assert sorted(int(n) for n in norad_ids) == [25544, 38833]
-        assert n_rfi_real == 2
 
     def test_preflight_resolution_is_reused_without_refetching(self, monkeypatch):
         # The normal path: TabConfig hands the fetchers the resolution preflight
@@ -549,9 +542,8 @@ class TestFetchOrbitalElementsPartial:
             },
         )
 
-        _, _, norad_ids, _, n_rfi_real = fetch_orbital_elements(resolution=resolution)
+        _, _, norad_ids, _ = fetch_orbital_elements(resolution=resolution)
         assert [int(n) for n in norad_ids] == [25544, 38833]
-        assert n_rfi_real == 2
 
 
 # ---------------------------------------------------------------------------

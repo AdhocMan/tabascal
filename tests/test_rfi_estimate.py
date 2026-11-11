@@ -978,7 +978,7 @@ class TestCoverageWithFullyMaskedSources:
 CHAN_WIDTH = float(np.diff(np.linspace(1.4e9, 1.41e9, N_FREQ))[0])
 
 
-def make_tab_config(n_rfi=3, n_rfi_real=2, n_ant=N_ANT, n_freq=N_FREQ,
+def make_tab_config(n_rfi=2, n_ant=N_ANT, n_freq=N_FREQ,
                     n_time=N_TIME, noise=0.1, rfi_mask=None, flags=None,
                     chans=None, chan_widths=None):
     """A TabConfig stub carrying exactly what the estimator reads off one.
@@ -987,8 +987,7 @@ def make_tab_config(n_rfi=3, n_rfi_real=2, n_ant=N_ANT, n_freq=N_FREQ,
     driver tests stub it the way the component tests do.
     """
     a1, a2 = pairs(n_ant)
-    ids = [40000 + i for i in range(n_rfi_real)]
-    ids = ids + [ids[-1]] * (n_rfi - n_rfi_real)
+    ids = [40000 + i for i in range(n_rfi)]
     times_jd = JD0 + np.arange(n_time) / 86400.0
     # `chans` stands in for a `-f` read: the config comes back on a subset of the
     # band, which anything it is differenced against has to be matched to.
@@ -1017,7 +1016,6 @@ def make_tab_config(n_rfi=3, n_rfi_real=2, n_ant=N_ANT, n_freq=N_FREQ,
         a2=a2,
         norad_ids=ids,
         n_rfi=n_rfi,
-        n_rfi_real=n_rfi_real,
         orbit_records=[make_tle_record(n, JD0) for n in ids],
         min_elevation=None if rfi_mask is None else 0.0,
         rfi_mask=rfi_mask,
@@ -1028,13 +1026,13 @@ def make_tab_config(n_rfi=3, n_rfi_real=2, n_ant=N_ANT, n_freq=N_FREQ,
 class TestLightCurvesFromConfig:
     """The in-process path: no second MS read, and already in norad_ids order."""
 
-    def test_only_the_real_satellites_come_back(self):
+    def test_every_configured_satellite_comes_back(self):
         config = make_tab_config()
 
         result = light_curves_from_config(config)
 
         assert result["light_curves"].shape == (2, N_FREQ, N_TIME)
-        assert result["norad_ids"] == config.norad_ids[:2]
+        assert result["norad_ids"] == config.norad_ids
 
     def test_the_rows_follow_the_configured_order(self):
         """Row i is satellite i's curve, so reversing the config reverses the rows.
@@ -1044,7 +1042,7 @@ class TestLightCurvesFromConfig:
         one epoch would produce identical curves and could not tell the ordering
         apart from a bug that ignores it.
         """
-        config = make_tab_config(n_rfi=2, n_rfi_real=2)
+        config = make_tab_config(n_rfi=2)
         records = {25544: make_tle_record(25544, JD0),
                    27386: make_tle_record(27386, JD0 - 0.02)}
         config.norad_ids = [25544, 27386]
@@ -1086,7 +1084,7 @@ class TestLightCurvesFromConfig:
         np.testing.assert_allclose(result["error"], expected, rtol=exact_rtol)
 
     def test_the_configured_elevation_mask_is_applied(self):
-        mask = np.ones((3, N_TIME), dtype=bool)
+        mask = np.ones((2, N_TIME), dtype=bool)
         mask[0, 2:] = False
         config = make_tab_config(rfi_mask=mask)
 
@@ -1094,7 +1092,7 @@ class TestLightCurvesFromConfig:
 
         assert np.all(result["light_curves"][0, :, 2:] == 0)
         assert not np.any(result["light_curves"][1] == 0)
-        np.testing.assert_array_equal(result["in_view"], mask[:2])
+        np.testing.assert_array_equal(result["in_view"], mask)
 
     def test_a_never_visible_satellite_is_a_zero_curve_not_an_error(self):
         """The estimator's answer for a satellite that never rose is zero.
@@ -1104,7 +1102,7 @@ class TestLightCurvesFromConfig:
         a zero curve is the measurement, and the satellites that *were* up must
         still be measurable without editing the config first.
         """
-        mask = np.ones((3, N_TIME), dtype=bool)
+        mask = np.ones((2, N_TIME), dtype=bool)
         mask[0] = False
         config = make_tab_config(rfi_mask=mask)
 
@@ -1200,7 +1198,7 @@ def stub_orbits(monkeypatch):
     def _fetch(times_jd=None, norad_ids=None, **kwargs):
         ids = [int(n) for n in norad_ids]
         records = [make_tle_record(n, JD0) for n in ids]
-        return None, None, ids, records, len(ids)
+        return None, None, ids, records
 
     monkeypatch.setattr(mod, "fetch_orbital_elements", _fetch)
     monkeypatch.setattr(
@@ -1756,7 +1754,7 @@ class TestCommandLine:
         assert built[0][2]["require_noise"] is False
         with np.load(out, allow_pickle=False) as npz:
             np.testing.assert_array_equal(
-                npz["norad_ids"], tab_config.norad_ids[:tab_config.n_rfi_real]
+                npz["norad_ids"], tab_config.norad_ids
             )
 
     def test_the_config_mode_keeps_the_configs_column_and_correlation(
@@ -1854,7 +1852,7 @@ class TestCommandLine:
         # constant residual would average away and say nothing about which
         # channel was taken.
         rfi_phase = rfi_phase_from_records(
-            tab_config.orbit_records[: tab_config.n_rfi_real],
+            tab_config.orbit_records,
             tab_config.ants_itrf,
             tab_config.times_jd,
             tab_config.phase_centre,

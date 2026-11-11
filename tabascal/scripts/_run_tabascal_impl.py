@@ -120,7 +120,7 @@ def print_devices():
     """Print a table of every *global* JAX device the run is spread over.
 
     Global rather than local: under multi-process only process 0 prints, and the
-    model is sharded over the full mesh (:func:`rfi_mesh` spans ``jax.devices()``),
+    model is sharded over the full mesh (:func:`mesh` spans ``jax.devices()``),
     so a local listing would understate what the job is actually using. The process
     column is what distinguishes the one-GPU-per-process layout from a
     single-process multi-GPU one at a glance.
@@ -462,7 +462,7 @@ def _subtract(config, paths):
         validate_opt(config["opt"])
 
     if sharding_enabled():
-        print(f"Sharding RFI sources over {jax.device_count()} devices:")
+        print(f"Sharding baselines over {jax.device_count()} devices:")
     else:
         print("Running on single device:")
 
@@ -479,14 +479,8 @@ def _subtract(config, paths):
     # Persist the real TLEs this run resolved so it can be reproduced later.
     # Only process 0 writes the shared result path in distributed runs.
     if is_process_0():
-        n_rfi_real = getattr(tab_config, "n_rfi_real", None)
         used_ids = getattr(tab_config, "norad_ids", None)
         used_records = getattr(tab_config, "orbit_records", None)
-        if n_rfi_real is not None:
-            used_ids = used_ids[:n_rfi_real] if used_ids is not None else None
-            used_records = (
-                used_records[:n_rfi_real] if used_records is not None else None
-            )
         saved_orbits = save_orbits_for_reuse(
             paths.used_orbits_path,
             used_ids,
@@ -501,19 +495,19 @@ def _subtract(config, paths):
 
     # Before sharding, so every rank perturbs the same local arrays the same way.
     model.init_params = jitter_init(
-        model.init_params, config["opt"].get("init_jitter"), config_seed(config),
-        n_rfi=tab_config.n_rfi, n_rfi_real=getattr(tab_config, "n_rfi_real", tab_config.n_rfi),
+        model.init_params, config["opt"].get("init_jitter"), config_seed(config)
     )
 
     if sharding_enabled():
-        # Split every leading-RFI-axis array across the device mesh and replicate
-        # the rest. _map_step takes all of these as traced jit arguments, so GSPMD
-        # propagates the shardings through the whole optimization (gradients and
-        # optimizer state included) from here on. (vis_obs/flags/noise were already
-        # globalized in TabConfig, before Model captured them in closures.)
-        model.init_params = shard_pytree(model.init_params, tab_config.n_rfi)
-        model.state = shard_pytree(model.state, tab_config.n_rfi)
-        model.constants = shard_pytree(model.constants, tab_config.n_rfi)
+        # Split every per-baseline array, and each device's own index rows,
+        # across the device mesh and replicate the rest. _map_step takes all of
+        # these as traced jit arguments, so GSPMD propagates the shardings through
+        # the whole optimization (gradients and optimizer state included) from
+        # here on. (vis_obs/flags/noise were already placed by Model, before the
+        # likelihood reads them.)
+        model.init_params = shard_pytree(model.init_params, tab_config.n_bl)
+        model.state = shard_pytree(model.state, tab_config.n_bl)
+        model.constants = shard_pytree(model.constants, tab_config.n_bl)
 
     _print_model_summary(tab_config, model, start_time)
 

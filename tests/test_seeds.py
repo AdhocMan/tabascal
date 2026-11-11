@@ -56,8 +56,8 @@ def ast_start(tmp_path, seed, init="sample"):
 
 
 def rfi_start(cls, seed, init="sample", r_seed=None):
-    """An RFI signal component with no dummy sources, set up on the mock config."""
-    config = make_rfi_config(n_rfi=3, n_rfi_real=3, init=init)
+    """An RFI signal component set up on the mock config."""
+    config = make_rfi_config(n_rfi=3, init=init)
     if r_seed is not None:
         config.args["rfi"]["r_seed"] = r_seed
     config.args["model"] = {"components": COMPONENTS}  # a real list, whose order no draw may read
@@ -311,7 +311,7 @@ def run_stubbed(tmp_path, monkeypatch, capsys, seed, n, jitter=None, events=None
         **dict.fromkeys(["_print_run_header", "_record_resolved_settings", "save_orbits_for_reuse",
                          "_print_model_summary", "write_results_xds"], lambda *a, **k: None),
         "_resolve_paths": lambda *a, **k: paths,
-        "build_model": lambda *a: (SimpleNamespace(vis_obs=None, n_rfi=4, n_rfi_real=3), model),
+        "build_model": lambda *a: (SimpleNamespace(vis_obs=None, n_rfi=3, n_bl=3), model),
         "load_truth": lambda *a: {},
         "run_key": lambda s: (spy("seed", 0)(s), run_key(s))[1],
         "init_predict": consumer("init", 2, 3),

@@ -88,7 +88,6 @@ def make_config(
     component="rfi_vis:RiemannVisFine",
     backend="ffi",
     n_rfi=None,
-    n_rfi_real=None,
     norad_ids=None,
     save_rfi_per_sat=True,
     corr="xx",
@@ -114,7 +113,6 @@ def make_config(
         n_int_time=N_INT_TIME,
         n_int_freq=N_INT_FREQ,
         n_rfi=n_rfi,
-        n_rfi_real=n_rfi if n_rfi_real is None else n_rfi_real,
         norad_ids=list(norad_ids),
         a1=a1,
         a2=a2,
@@ -146,13 +144,12 @@ def _forward(config):
     return comp.build_forward(), constants
 
 
-def make_pred(config, n_sample=1, dark=0, seed=42):
+def make_pred(config, n_sample=1, seed=42):
     """A ``vi_pred``-shaped dict: a fitted fine grid and the ``vis_rfi`` it gives.
 
     ``vis_rfi`` is computed by the same component the decomposition will use,
     so the sum-back is a statement about the decomposition rather than about two
-    different models. ``dark`` is the number of trailing sources held at zero
-    amplitude, which is what the sharding padding does to its dummy sources.
+    different models.
 
     Every sample is **different** -- scaled in amplitude and offset in phase, and
     each one put through the op on its own. Broadcasting one sample across the
@@ -175,9 +172,6 @@ def make_pred(config, n_sample=1, dark=0, seed=42):
         jax.random.normal(jax.random.PRNGKey(seed + 1), shape)
         + 1j * jax.random.normal(jax.random.PRNGKey(seed + 2), shape)
     ).astype(_complex_dtype())
-
-    if dark:
-        amp = amp.at[n_rfi - dark :].set(0)
 
     forward, constants = _forward(config)
     vis_zero = jnp.zeros((N_BL, N_FREQ, N_TIME), dtype=_complex_dtype())
@@ -379,61 +373,6 @@ class TestTheDecompositionSumsBack:
         )
 
 
-class TestPaddedSatellites:
-    """Sharding pads the source list with dark dummies; they are not satellites."""
-
-    @staticmethod
-    def _padded_config(component="rfi_vis:RiemannVisFine", backend="ffi"):
-        return make_config(
-            component=component,
-            backend=backend,
-            # The padding duplicates the last satellite.
-            norad_ids=NORAD_IDS + [NORAD_IDS[-1]],
-            n_rfi_real=len(NORAD_IDS),
-        )
-
-    def test_only_the_real_satellites_are_stored(self):
-        config = self._padded_config()
-        pred = make_pred(config, dark=1)
-
-        vis_src, norad_ids = rfi_vis_per_sat(pred, config)
-
-        assert norad_ids == NORAD_IDS
-        assert vis_src.shape[1] == len(NORAD_IDS)
-        # The dropped row was dark, so the real sources are still the whole of it.
-        _assert_sums_back(
-            vis_src.sum(axis=1),
-            pred["vis_rfi"],
-            vis_src,
-            n_ulp=PRACTICAL_REASSOCIATION_ULPS,
-            dtype=np.dtype(_real_dtype()),
-        )
-
-    @pytest.mark.parametrize("component,backend", RFI_VIS_COMPONENTS)
-    def test_the_padded_row_carried_nothing(self, component, backend):
-        """The premise of dropping it: a dummy source contributes exactly zero.
-
-        Per component, because each reduces over the source axis differently and
-        it is that reduction which has to leave a dark row at precisely zero --
-        not merely small.
-        """
-        config = self._padded_config(component, backend)
-        pred = make_pred(config, dark=1)
-        forward, constants = _forward(config)
-
-        dummy = forward(
-            {},
-            {
-                "rfi_A": pred["rfi_A"][0, -1:],
-                "rfi_phase": pred["rfi_phase"][0, -1:],
-                "vis_rfi": jnp.zeros((N_BL, N_FREQ, N_TIME), dtype=_complex_dtype()),
-            },
-            constants,
-        )["vis_rfi"]
-
-        np.testing.assert_array_equal(np.asarray(dummy), 0)
-
-
 class TestFineGridCancellation:
     """The case with no bound: why the kernel-level claim stays qualitative.
 
@@ -460,7 +399,7 @@ class TestFineGridCancellation:
 
         return SimpleNamespace(
             n_ant=2, n_bl=1, n_time=1, n_freq=1, n_int_time=2, n_int_freq=1,
-            n_rfi=2, n_rfi_real=2, norad_ids=NORAD_IDS[:2],
+            n_rfi=2, norad_ids=NORAD_IDS[:2],
             a1=jnp.asarray([0], dtype=jnp.int32),
             a2=jnp.asarray([1], dtype=jnp.int32),
             precision="double" if jax.config.read("jax_enable_x64") else "single",
@@ -784,7 +723,7 @@ class TestTheStoreIsStreamedInto:
     they pin is the mechanism and not its purpose: the loop makes all
     ``n_sample x n_rfi`` evaluations past an injected failure instead of leaving
     early, and the store is gone afterwards. That a *second* rank is therefore
-    not left waiting in a ``psum_over_rfi`` collective with nobody to meet is why
+    not left waiting in a ``map_over_baselines`` collective with nobody to meet is why
     the mechanism is shaped this way, and no test here asserts it.
 
     The rest of that story is split across two other places: that every failure
