@@ -711,6 +711,9 @@ def _predict(prob_model, key, params, obs_data, state, constants, vis_obs, noise
         posterior_samples=tree_map(lambda x: x[None], params),
         batch_ndims=1,
     )(key, obs_data=obs_data, state=state, constants=constants)
+    # The likelihood's obs site is visibility-sized -- the data when there are
+    # data, a draw of the noise when there are not -- and nothing reads it.
+    pred.pop("obs", None)
     return constrain_prediction(pred), reduced_chi2(pred["vis_obs"][0], vis_obs, noise, flags)
 
 

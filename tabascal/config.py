@@ -36,6 +36,7 @@ from tabascal.interferometry import (
 from tabascal.fft_gp import domain_ss
 from tabascal.time import JulianDate, DAY_SECS, secs_to_days, gast_deg
 
+import jax
 import jax.numpy as jnp
 
 import numpy as np
@@ -777,6 +778,10 @@ class TabConfig:
 # RMSE diagnostics. Every other state key comes from a component.
 BASE_STATE_KEYS = ("vis_ast", "vis_rfi", "rmse_ast", "rmse_rfi", "rmse_gains")
 
+# The data-grid visibilities, zero at the start of every forward pass and made
+# there rather than held in Model.state (see Model.__init__).
+VIS_STATE_KEYS = ("vis_ast", "vis_rfi", "vis_obs")
+
 
 class Model:
 
@@ -799,13 +804,36 @@ class Model:
         # component to point at.
         validate_component_order(components, BASE_STATE_KEYS)
 
+        # The data-grid visibilities start at zero in every forward pass: the
+        # vis components add into vis_ast and vis_rfi and the gains overwrite
+        # vis_obs. They are therefore not held as arrays -- the forward makes
+        # the zeros inside the trace, where XLA folds them away. Held, each was
+        # a visibility cube fed to every compiled step, and whole on every
+        # device wherever the baselines do not divide. Only their shape and
+        # dtype are kept, as the components' placeholders too, so that no copy
+        # of them outlives setup.
+        self.vis_templates = {}
         for comp in components:
             comp.setup(tab_config)
+            outputs = dict(comp.state_outputs)
+            for key in VIS_STATE_KEYS:
+                if key in outputs:
+                    vis = outputs.pop(key)
+                    self.vis_templates[key] = jax.ShapeDtypeStruct(vis.shape, vis.dtype)
             # Components keep their output placeholders after assembly, so
-            # placing only Model.state below would leave the originals -- whole
-            # visibility cubes among them -- alive on device 0. Place the
-            # retained originals themselves, before anything takes a reference.
-            comp.state_outputs = shard_pytree(comp.state_outputs, tab_config.n_bl)
+            # placing only Model.state below would leave the originals alive on
+            # device 0. Place the retained originals themselves, before
+            # anything takes a reference.
+            outputs = shard_pytree(outputs, tab_config.n_bl)
+            for key in VIS_STATE_KEYS:
+                if key in comp.state_outputs:
+                    outputs[key] = self.vis_templates[key]
+            comp.state_outputs = outputs
+        # vis_ast and vis_rfi are Model's own (BASE_STATE_KEYS), shaped as the
+        # observations whatever writes them.
+        vis_obs = self.vis_templates["vis_obs"]
+        for key in VIS_STATE_KEYS:
+            self.vis_templates.setdefault(key, vis_obs)
 
         # Every reader of the whole observations on the host is done.
         tab_config.place_observations()
@@ -823,15 +851,14 @@ class Model:
         self.init_params = {k: v for d in init_params for k, v in d.items()}
 
         state = [comp.state_outputs for comp in components]
-        self.state = {k: v for d in state for k, v in d.items()}
+        self.state = {
+            k: v for d in state for k, v in d.items() if k not in VIS_STATE_KEYS
+        }
 
         self.constants = {}
         for comp in components:
             for key, value in comp.build_constants().items():
                 self.constants[f"{comp.prefix}/{key}"] = value
-
-        self.state["vis_ast"] = jnp.zeros_like(self.state["vis_obs"])
-        self.state["vis_rfi"] = jnp.zeros_like(self.state["vis_obs"])
 
         self.state["rmse_ast"] = jnp.array([jnp.nan])
         self.state["rmse_rfi"] = jnp.array([jnp.nan])
@@ -842,10 +869,15 @@ class Model:
 
     def build_forward(self):
         forwards = [comp.build_forward() for comp in self.components]
-        # The baseline count the visibilities carry, read off the array itself.
-        n_bl = self.state["vis_obs"].shape[0]
+        templates = self.vis_templates
+        # The baseline count the visibilities carry.
+        n_bl = templates["vis_obs"].shape[0]
 
         def forward(params, state, constants):
+
+            # A state passed in with its own visibilities keeps them.
+            zeros = {key: jnp.zeros(t.shape, t.dtype) for key, t in templates.items()}
+            state = constrain_baseline_state({**zeros, **state}, n_bl)
 
             for sub_forward in forwards:
                 state = sub_forward(params, state, constants)

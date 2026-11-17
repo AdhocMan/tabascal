@@ -540,6 +540,9 @@ def _subtract(config, paths):
     if config["plots"]["init"] and is_process_0():
         from tabascal.plot import plot_init
         plot_init(tab_config, init_pred, truth, paths.name, paths.plot_dir)
+    # Written and plotted: let its visibilities, each replicated on every
+    # device under sharding, go before the fit and the MAP prediction.
+    del init_pred
 
     key, subkey = random.split(key)
     if config["plots"]["prior"]:
